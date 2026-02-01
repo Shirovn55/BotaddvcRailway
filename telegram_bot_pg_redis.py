@@ -3928,6 +3928,21 @@ def tool_get_vouchers():
     if not rows:
         return {"ok": True, "vouchers": []}, 200
 
+    # Lấy thongbao từ dòng đầu có giá trị
+    thongbao = ""
+    for row in rows:
+        def _get_tb(*keys):
+            for k in keys:
+                for rk in row:
+                    if str(rk).strip().lower() == k.lower():
+                        v = row[rk]
+                        return str(v).strip() if v is not None else ""
+            return ""
+        tb = _get_tb("thongbao")
+        if tb:
+            thongbao = tb
+            break
+
     # Normalize header keys (get_all_records trả dict với key = header text)
     items = []
     for row in rows:
@@ -3971,7 +3986,7 @@ def tool_get_vouchers():
             "signature":     signature
         })
 
-    return {"ok": True, "vouchers": items}, 200
+    return {"ok": True, "vouchers": items, "thongbao": thongbao}, 200
 
 
 
