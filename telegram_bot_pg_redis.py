@@ -3900,7 +3900,68 @@ def _tool_auth():
     return True, None
 
 
-@app.route("/tool/wallet", methods=["GET"])
+@app.route("/tool/vouchers", methods=["GET"])
+def tool_get_vouchers():
+    """
+    GET /tool/vouchers
+    → [{"source","code_name","code","price","status","promotion_id","signature"}, ...]
+    Không cần pass — voucher list là public.
+    """
+    auth_ok, auth_err = _tool_auth()
+    if not auth_ok:
+        return auth_err
+
+    rows = get_voucher_stock_cached()
+    if not rows:
+        return {"ok": True, "vouchers": []}, 200
+
+    # Normalize header keys (get_all_records trả dict với key = header text)
+    items = []
+    for row in rows:
+        # Tìm các field linh hoạt giống tool cũ
+        def _get(*keys):
+            for k in keys:
+                for rk in row:
+                    if str(rk).strip().lower() == k.lower():
+                        v = row[rk]
+                        return str(v).strip() if v is not None else ""
+            return ""
+
+        code        = _get("code", "code_name", "voucher_code")
+        display     = _get("display_name", "display name", "ten_ma", "tên mã", "ten ma")
+        source      = _get("source", "nguon", "nguồn", "STT")
+        price_str   = _get("price", "cost", "gia", "giá")
+        status      = _get("status", "trang_thai", "trạng thái")
+        promo_id    = _get("promotion_id", "promotionid")
+        signature   = _get("signature", "chữ ký", "chu ky")
+
+        if not code:
+            continue
+
+        try:
+            price = int(price_str.replace(",", "")) if price_str else 1000
+        except (ValueError, TypeError):
+            price = 1000
+
+        try:
+            promo_id_int = int(promo_id) if promo_id else 0
+        except (ValueError, TypeError):
+            promo_id_int = 0
+
+        items.append({
+            "source":        source or "Sheet",
+            "code_name":     display or code,
+            "code":          code,
+            "price":         price,
+            "status":        status or "Sẵn sàng",
+            "promotion_id":  promo_id_int,
+            "signature":     signature
+        })
+
+    return {"ok": True, "vouchers": items}, 200
+
+
+
 def tool_get_wallet():
     """
     GET /tool/wallet?tele_id=123&pass=abc
