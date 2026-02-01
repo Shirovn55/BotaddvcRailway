@@ -3911,7 +3911,6 @@ def tool_debug():
         "tool_api_key_last2": k[-2:] if len(k) >= 2 else k,
         "tool_api_key_repr": repr(k)
     }, 200
-    return True, None
 
 
 @app.route("/tool/vouchers", methods=["GET"])
