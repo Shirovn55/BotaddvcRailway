@@ -3962,6 +3962,7 @@ def tool_get_vouchers():
 
 
 
+@app.route("/tool/wallet", methods=["GET"])
 def tool_get_wallet():
     """
     GET /tool/wallet?tele_id=123&pass=abc
