@@ -4098,6 +4098,48 @@ def tool_deduct():
     return {"ok": True, "balance": new_balance}, 200
 
 
+@app.route("/tool/log", methods=["POST"])
+def tool_log():
+    """
+    POST /tool/log
+    body: {"tele_id": 123, "username": "xxx", "voucher_name": "voucher100", "success": 2, "total": 2, "price": 2000, "balance_after": 96000}
+    → ghi 1 dòng vào Sheet Logs
+    """
+    auth_ok, auth_err = _tool_auth()
+    if not auth_ok:
+        return auth_err
+
+    body = request.get_json(silent=True) or {}
+    tele_id      = str(body.get("tele_id", ""))
+    username     = str(body.get("username", ""))
+    voucher_name = str(body.get("voucher_name", ""))
+    success      = int(body.get("success", 0))
+    total        = int(body.get("total", 0))
+    price        = int(body.get("price", 0))
+    balance_after= int(body.get("balance_after", 0))
+
+    if not SHEET_READY:
+        return {"ok": False, "error": "Sheet not ready"}, 503
+
+    try:
+        # Format: "Tool PC : Lưu voucher100 2/2 thành công"
+        note = f"Tool PC : Lưu {voucher_name} {success}/{total} thành công"
+
+        ws_log.append_row([
+            now_str(),
+            tele_id,
+            username,
+            "VOUCHER",
+            str(price),
+            note
+        ])
+        dprint(f"🛠️ TOOL LOG: {note} | tele_id={tele_id}")
+        return {"ok": True}, 200
+    except Exception as e:
+        dprint(f"🛠️ TOOL LOG error: {e}")
+        return {"ok": False, "error": str(e)}, 500
+
+
 # =========================================================
 # LOCAL RUNNER
 # =========================================================
