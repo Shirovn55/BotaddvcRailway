@@ -333,9 +333,6 @@ while retry_count < MAX_RETRIES and not connected:
         print("✅ ✅ ✅ GOOGLE SHEETS CONNECTED SUCCESSFULLY!")
         print("=" * 60)
 
-        # ✅ Init PostgreSQL + Redis (Wallet DB + Anti-spam)
-        system_init_pg_redis()
-
     except Exception as e:
         retry_count += 1
         wait_time = 2 ** retry_count
@@ -354,6 +351,12 @@ while retry_count < MAX_RETRIES and not connected:
             traceback.print_exc()
             print("=" * 60)
             SHEET_READY = False
+
+# =========================================================
+# ✅ Init PostgreSQL + Redis — LUÔN chạy, không phụ thuộc Sheet
+# =========================================================
+print("🔄 Initializing PostgreSQL + Redis...")
+system_init_pg_redis()
 
 # =========================================================
 # 🔥 PRELOAD USERS + ROW CACHE (chạy 1 lần khi khởi động)
@@ -609,6 +612,7 @@ def build_main_keyboard(is_active=True):
         "keyboard": [
             ["💎 Nạp tiền", "💰 Số dư"],
             ["🎁 Lưu Voucher", "🔑 Get Cookie QR"],
+            ["🖥️ Lấy PASS Tool PC"],
             ["🧩 Hệ Thống Bot"]
         ],
         "resize_keyboard": True
@@ -871,25 +875,31 @@ def track_qr_failure(user_id, username, chat_id):
         
         # Ban vĩnh viễn nếu >= 5 lần
         if fail_count >= MAX_QR_FAILURES:
-            # Ban user trong sheet
+            # Ban user trong PostgreSQL
             try:
-                row, _, _ = get_user_data(user_id)
-                if row:
-                    # Update trạng thái: Ban vĩnh viễn
-                    ws_money.update(f'D{row}', [["BANNED_QR_SPAM"]])
-                    
-                    # Thông báo admin
-                    admin_msg = (
-                        f"🚨 <b>BAN VĨNH VIỄN - QR SPAM</b>\n\n"
-                        f"👤 <b>User ID:</b> <code>{user_id}</code>\n"
-                        f"📝 <b>Username:</b> @{username or 'N/A'}\n"
-                        f"🔢 <b>Số lần thất bại:</b> {fail_count}\n"
-                        f"⏰ <b>Thời gian:</b> {now_str()}\n\n"
-                        f"⚠️ <b>Lý do:</b> Get QR thất bại {fail_count} lần liên tục"
-                    )
-                    tg_send(ADMIN_ID, admin_msg)
-                    
-                    dprint(f"🚨 BANNED USER {user_id} for QR spam ({fail_count} failures)")
+                pg_exec("UPDATE wallet SET status='BANNED_QR_SPAM', updated_at=NOW() WHERE tele_id=%s", (int(user_id),))
+
+                # Mirror Sheet (fire-and-forget)
+                if SHEET_READY:
+                    try:
+                        row = get_user_row(user_id)
+                        if row:
+                            ws_money.update(f'D{row}', [["BANNED_QR_SPAM"]])
+                    except Exception:
+                        pass
+
+                # Thông báo admin
+                admin_msg = (
+                    f"🚨 <b>BAN VĨNH VIỄN - QR SPAM</b>\n\n"
+                    f"👤 <b>User ID:</b> <code>{user_id}</code>\n"
+                    f"📝 <b>Username:</b> @{username or 'N/A'}\n"
+                    f"🔢 <b>Số lần thất bại:</b> {fail_count}\n"
+                    f"⏰ <b>Thời gian:</b> {now_str()}\n\n"
+                    f"⚠️ <b>Lý do:</b> Get QR thất bại {fail_count} lần liên tục"
+                )
+                tg_send(ADMIN_ID, admin_msg)
+
+                dprint(f"🚨 BANNED USER {user_id} for QR spam ({fail_count} failures)")
             except Exception as e:
                 dprint(f"Error banning user {user_id}: {e}")
             
@@ -923,8 +933,8 @@ def get_user_cookie(user_id):
 def handle_get_cookie_qr(chat_id, user_id, username):
     """Xử lý lệnh Get Cookie QR - Y HỆT bot gốc"""
     # Check user tồn tại
-    row, balance, status = get_user_data(user_id)
-    if not row:
+    exists, balance, status = get_user_data(user_id)
+    if not exists:
         send_message(chat_id, "❌ Vui lòng /start trước khi dùng chức năng này")
         return
 
@@ -1459,52 +1469,55 @@ def track_error(user_id, username="", reason=""):
 
 def check_ban_status(user_id):
     """
-    Check ban status:
-    - Ưu tiên đọc notes từ PostgreSQL
-    - Fallback đọc Sheet nếu chưa cấu hình PG
+    ✅ V7: Đọc ban status từ cột 'status' trong PostgreSQL.
+    - status = 'banned'     → Ban vĩnh viễn
+    - status = 'ban_1h'     → Ban 1h, check thời gian từ notes
+    - status = 'BANNED_QR_SPAM' → Ban QR spam (permanent)
     """
-    if not SHEET_READY:
-        return {"banned": False}
-
     user_id = int(user_id)
 
-    note = ""
-    if PG_POOL is not None:
-        r = pg_exec("SELECT notes FROM wallet WHERE tele_id=%s", (user_id,), fetchone=True)
-        if r:
-            note = (r[0] or "") if r else ""
-    else:
-        row = get_user_row(user_id)
-        if row:
-            try:
-                note = ws_money.cell(row, 6).value or ""
-            except:
-                note = ""
+    if PG_POOL is None:
+        return {"banned": False}
+
+    r = pg_exec("SELECT status, notes FROM wallet WHERE tele_id=%s", (user_id,), fetchone=True)
+    if not r:
+        return {"banned": False}
+
+    status = (r[0] or "").strip().lower()
+    notes  = (r[1] or "").strip()
 
     try:
-        if "BAN VĨNH VIỄN" in (note or "").upper():
+        # Ban vĩnh viễn
+        if status in ("banned", "banned_qr_spam"):
             return {"banned": True, "type": "PERMANENT", "until": "Vĩnh viễn"}
 
-        if "BAN 1H:" in (note or ""):
+        # Ban 1 giờ — thời gian lưu trong notes
+        if status == "ban_1h":
             try:
-                ban_until_str = note.split("BAN 1H:")[1].strip()
-                ban_until = datetime.strptime(ban_until_str, "%Y-%m-%d %H:%M")
-                if now_datetime() < ban_until:
-                    return {"banned": True, "type": "1H", "until": ban_until_str}
+                ban_until_str = notes.split("BAN 1H:")[1].strip() if "BAN 1H:" in notes else ""
+                if ban_until_str:
+                    ban_until = datetime.strptime(ban_until_str, "%Y-%m-%d %H:%M")
+                    if now_datetime() < ban_until:
+                        return {"banned": True, "type": "1H", "until": ban_until_str}
+                    else:
+                        # hết hạn → reset status + notes
+                        pg_exec("UPDATE wallet SET status='active', notes='auto từ bot', updated_at=NOW() WHERE tele_id=%s", (user_id,))
+                        # mirror sheet (fire-and-forget)
+                        if SHEET_READY:
+                            try:
+                                row = get_user_row(user_id)
+                                if row:
+                                    ws_money.update_cell(row, 4, "active")
+                                    ws_money.update_cell(row, 6, "auto từ bot")
+                            except Exception:
+                                pass
+                        return {"banned": False}
                 else:
-                    # hết hạn -> reset note
-                    if PG_POOL is not None:
-                        pg_exec("UPDATE wallet SET notes=%s, updated_at=NOW() WHERE tele_id=%s", ("auto từ bot", user_id))
-                    # mirror sheet
-                    row = get_user_row(user_id)
-                    if row:
-                        try:
-                            ws_money.update_cell(row, 6, "auto từ bot")
-                        except:
-                            pass
+                    # notes không có thời gian → treat as expired, reset
+                    pg_exec("UPDATE wallet SET status='active', updated_at=NOW() WHERE tele_id=%s", (user_id,))
                     return {"banned": False}
-            except:
-                pass
+            except Exception:
+                return {"banned": False}
 
         return {"banned": False}
 
@@ -1517,7 +1530,7 @@ def notify_admin_spam(user_id, username, ban_type, error_count):
         return
 
     try:
-        row, balance, status = get_user_data(user_id)
+        exists, balance, status = get_user_data(user_id)
 
         if ban_type == "PERMANENT":
             ban_text = "🔨 Hành động: Ban vĩnh viễn"
@@ -1554,35 +1567,40 @@ def notify_admin_spam(user_id, username, ban_type, error_count):
 
 def apply_ban(user_id, ban_type):
     """
-    Apply ban:
-    - Ghi notes vào PostgreSQL (nguồn chính)
-    - Mirror ra Sheet để bạn nhìn thấy
+    ✅ V7: Apply ban → ghi vào cột status.
+    - PERMANENT: status = 'banned'
+    - 1H:        status = 'ban_1h', notes = 'BAN 1H: <thời gian>'
+    - Sheet mirror: fire-and-forget
     """
-    if not SHEET_READY:
-        return
-
     user_id = int(user_id)
     ensure_user_exists(user_id, username="")
 
     try:
         if ban_type == "PERMANENT":
-            note = "BAN VĨNH VIỄN: Spam"
+            new_status = "banned"
+            note = "Ban vĩnh viễn: Spam"
         else:
+            new_status = "ban_1h"
             ban_until = now_datetime() + timedelta(seconds=BAN_DURATION_1H)
             note = f"BAN 1H: {ban_until.strftime('%Y-%m-%d %H:%M')}"
 
-        # ✅ update PG
+        # ✅ update PG — status + notes
         if PG_POOL is not None:
-            pg_exec("UPDATE wallet SET notes=%s, updated_at=NOW() WHERE tele_id=%s", (note, user_id))
+            pg_exec("UPDATE wallet SET status=%s, notes=%s, updated_at=NOW() WHERE tele_id=%s",
+                    (new_status, note, user_id))
 
-        # ✅ mirror sheet
-        row = get_user_row(user_id)
-        if row:
-            ws_money.update_cell(row, 6, note)
-            invalidate_user_row_cache(user_id)
+        # ✅ mirror sheet (fire-and-forget)
+        if SHEET_READY:
+            try:
+                row = get_user_row(user_id)
+                if row:
+                    ws_money.update_cell(row, 4, new_status)
+                    ws_money.update_cell(row, 6, note)
+            except Exception:
+                pass
 
-        log_row(user_id, "", "BAN_APPLIED", ban_type, note)
-        dprint(f"✅ Applied ban: {user_id} → {ban_type}")
+        log_row(user_id, "", "BAN_APPLIED", ban_type, f"status={new_status} | {note}")
+        dprint(f"✅ Applied ban: {user_id} → {ban_type} (status={new_status})")
 
     except Exception as e:
         dprint("apply_ban error:", e)
@@ -1611,119 +1629,73 @@ def get_user_row(user_id):
             cache_user_row(user_id, row)
 
         return row
-    except Exception:
+    except Exception as e:
+        import traceback
+        dprint(f"❌ get_user_row FAILED for user {user_id}: {type(e).__name__}: {e}")
+        dprint(f"   Traceback: {traceback.format_exc()}")
         return None
 
 def ensure_user_exists(user_id, username=""):
     """
-    ✅ Đảm bảo user tồn tại:
-    - Postgres: tạo dòng wallet nếu chưa có
-    - Google Sheet (Thanh Toan): chỉ để theo dõi (optional), giữ behavior cũ để bot không lỗi
+    ✅ V6 PG-PRIMARY:
+    - PostgreSQL: tạo dòng wallet nếu chưa có (nguồn chính)
+    - Google Sheet: mirror fire-and-forget (không block critical path)
     """
-    if not SHEET_READY:
-        return
-
     user_id = int(user_id)
 
-    # 1) đảm bảo có row trong Sheet để bot không lỗi (nhiều chỗ vẫn check row)
-    row = get_user_row(user_id)
-    if not row:
-        try:
-            # tạo row mới
-            ws_money.append_row([
-                str(user_id),
-                username or "",
-                NEW_USER_BONUS,
-                "active",
-                "auto từ bot",
-                ""  # gift
-            ])
-            invalidate_user_row_cache(user_id)
-            row = get_user_row(user_id)
-        except Exception as e:
-            dprint(f"ensure_user_exists append_row error: {e}")
-
-    # 2) đảm bảo có trong Postgres (nếu bật)
     if PG_POOL is None:
         return
 
-    # nếu đã có -> update username nhẹ
-    r = pg_exec("SELECT tele_id FROM wallet WHERE tele_id=%s", (user_id,), fetchone=True)
-    if r:
-        if username:
-            pg_exec("UPDATE wallet SET username=%s, updated_at=NOW() WHERE tele_id=%s", (username, user_id))
-        return
-
-    # Nếu chưa có trong PG: cố import balance từ Sheet (Thanh Toan) để không mất dữ liệu
-    balance = NEW_USER_BONUS
-    status = "active"
-    notes = "auto từ bot"
-    gift = ""
-    try:
-        if row:
-            balance = int(float(ws_money.cell(row, 3).value or NEW_USER_BONUS))
-            status = (ws_money.cell(row, 4).value or "active").strip()
-            notes = (ws_money.cell(row, 5).value or "auto từ bot").strip()
-            gift = (ws_money.cell(row, 6).value or "").strip()
-    except Exception:
-        pass
-
+    # 1) PG: INSERT mới hoặc update username nếu đã có
     pg_exec("""
         INSERT INTO wallet (tele_id, username, balance, status, notes, gift)
-        VALUES (%s, %s, %s, %s, %s, %s)
-        ON CONFLICT (tele_id) DO NOTHING
-    """, (user_id, username or "", int(balance), status, notes, gift))
+        VALUES (%s, %s, %s, 'active', 'auto từ bot', '')
+        ON CONFLICT (tele_id) DO UPDATE SET
+            username = CASE WHEN %s <> '' THEN %s ELSE wallet.username END,
+            updated_at = NOW()
+    """, (user_id, username or "", NEW_USER_BONUS, username or "", username or ""))
 
-def get_user_data(user_id, force_refresh=False):
-    """
-    ✅ V5 HYBRID:
-    - Row vẫn lấy từ Sheet (để giữ logic cũ không phải sửa nhiều)
-    - Balance/Status lấy từ PostgreSQL (chuẩn + nhanh)
-    """
-    if not SHEET_READY:
-        return None, 0, ""
-
-    # ✅ row cache (force_refresh: xoá cache để tìm lại)
-    if force_refresh:
-        invalidate_user_row_cache(user_id)
-
-    row = get_user_row(user_id)
-    if not row:
-        return None, 0, ""
-
-    # đảm bảo user có trong PG
-    ensure_user_exists(user_id, username="")
-
-    if PG_POOL is None:
-        # fallback sheet balance/status
-        try:
-            bal = int(ws_money.cell(row, 3).value or 0)
-            status = (ws_money.cell(row, 4).value or "").strip()
-            return row, bal, status
-        except:
-            return row, 0, ""
-
-    r = pg_exec("SELECT balance, status FROM wallet WHERE tele_id=%s", (int(user_id),), fetchone=True)
-    if not r:
-        return row, 0, ""
-    bal = int(r[0] or 0)
-    status = (r[1] or "").strip()
-    return row, bal, status
-
-def get_balance_direct(user_id):
-    """
-    ✅ ĐỌC BALANCE TỪ POSTGRES (Nhanh + chuẩn + không lệch tiền)
-    Fallback: nếu chưa cấu hình PG thì đọc từ Sheet như cũ.
-    """
-    if PG_POOL is None:
-        # fallback sheet
+    # 2) Sheet mirror (fire-and-forget) — chỉ để theo dõi
+    if SHEET_READY:
         try:
             row = get_user_row(user_id)
             if not row:
-                return 0
-            return int(ws_money.cell(row, 3).value or 0)
-        except:
-            return 0
+                ws_money.append_row([
+                    str(user_id),
+                    username or "",
+                    NEW_USER_BONUS,
+                    "active",
+                    "auto từ bot",
+                    ""
+                ])
+                invalidate_user_row_cache(user_id)
+        except Exception as e:
+            dprint(f"ensure_user_exists sheet mirror error: {e}")
+
+def get_user_data(user_id):
+    """
+    ✅ V6 PG-ONLY:
+    - Đọc hoàn toàn từ PostgreSQL (nguồn chính)
+    - Không phụ thuộc Google Sheet
+    Returns: (exists: bool, balance: int, status: str)
+    """
+    if PG_POOL is None:
+        return False, 0, ""
+
+    r = pg_exec("SELECT balance, status FROM wallet WHERE tele_id=%s", (int(user_id),), fetchone=True)
+    if not r:
+        return False, 0, ""
+
+    bal = int(r[0] or 0)
+    status = (r[1] or "").strip()
+    return True, bal, status
+
+def get_balance_direct(user_id):
+    """
+    ✅ V6 PG-ONLY: Đọc balance từ PostgreSQL.
+    """
+    if PG_POOL is None:
+        return 0
 
     r = pg_exec("SELECT balance FROM wallet WHERE tele_id=%s", (int(user_id),), fetchone=True)
     if not r:
@@ -1740,20 +1712,9 @@ def update_balance_atomic(user_id, delta):
     - Không lệch tiền khi nhiều request song song
     - Mirror ra Google Sheet (tuỳ chọn) để bạn theo dõi
     """
-    # fallback sheet nếu chưa có PG
     if PG_POOL is None:
-        # gọi logic cũ đơn giản: đọc + ghi (có thể lệch nếu spam)
-        try:
-            row = get_user_row(user_id)
-            if not row:
-                return False, 0
-            current = int(ws_money.cell(row, 3).value or 0)
-            new_balance = max(0, current + int(delta))
-            ws_money.update_cell(row, 3, new_balance)
-            return True, new_balance
-        except Exception as e:
-            dprint(f"update_balance_atomic(sheet fallback) error: {e}")
-            return False, 0
+        dprint("⚠️ update_balance_atomic: PG_POOL is None")
+        return False, 0
 
     ensure_user_exists(user_id, username="")
 
@@ -1801,20 +1762,8 @@ def deduct_balance_atomic(user_id, need_amount):
         return True, bal
 
     if PG_POOL is None:
-        # fallback sheet
-        try:
-            row = get_user_row(user_id)
-            if not row:
-                return False, 0
-            current_balance = int(ws_money.cell(row, 3).value or 0)
-            if current_balance < need_amount:
-                return False, current_balance
-            new_balance = current_balance - need_amount
-            ws_money.update_cell(row, 3, new_balance)
-            return True, new_balance
-        except Exception as e:
-            dprint(f"deduct_balance_atomic(sheet fallback) error: {e}")
-            return False, 0
+        dprint("⚠️ deduct_balance_atomic: PG_POOL is None")
+        return False, 0
 
     ensure_user_exists(user_id, username="")
 
@@ -2483,29 +2432,29 @@ def build_quick_buy_keyboard(cmd):
 # =========================================================
 def handle_active_gift_5k(user_id, username):
     """
-    ✅ Kích hoạt tài khoản + Tặng quà
-    
-    LOGIC:
-    - Chỉ user có status trong ALLOWED_GIFT_STATUS mới được nhận
-    - Admin set "inactive" → KHÔNG được nhận (tránh abuse)
-    - Dùng ACTIVE_GIFT_AMOUNT thống nhất
-    - Log riêng action "ACTIVE_GIFT_CLICK"
+    ✅ V6 PG-PRIMARY: Kích hoạt tài khoản + Tặng quà
+    - Đọc/ghi status + balance từ PostgreSQL (nguồn chính)
+    - Sheet mirror là fire-and-forget
     """
-    if not SHEET_READY:
+    if PG_POOL is None:
         return False, "❌ Hệ thống đang lỗi."
 
-    row = get_user_row(user_id)
-    if not row:
-        row = ensure_user_exists(user_id, username)
+    user_id = int(user_id)
+    ensure_user_exists(user_id, username)
 
-    data = ws_money.row_values(row)
-    status = data[3] if len(data) > 3 else ""
+    # Đọc status + balance từ PG
+    r = pg_exec("SELECT balance, status FROM wallet WHERE tele_id=%s", (user_id,), fetchone=True)
+    if not r:
+        return False, "❌ Không tìm thấy tài khoản."
+
+    current_balance = int(r[0] or 0)
+    status = (r[1] or "").strip()
 
     # ✅ CHECK 1: Đã active rồi
     if status == "active":
         return False, "⚠️ Tài khoản đã kích hoạt, không thể nhận khuyến mãi."
-    
-    # ✅ CHECK 2: Status không được phép (admin set "inactive", "banned", etc.)
+
+    # ✅ CHECK 2: Status không được phép
     if status not in ALLOWED_GIFT_STATUS:
         dprint(f"⚠️ User {user_id} status '{status}' not allowed for gift")
         return False, (
@@ -2514,27 +2463,34 @@ def handle_active_gift_5k(user_id, username):
         )
 
     try:
-        current_balance = int(data[2]) if len(data) > 2 else 0
-        
-        # ✅ FIX: Dùng ACTIVE_GIFT_AMOUNT thống nhất (5100đ)
         new_balance = current_balance + ACTIVE_GIFT_AMOUNT
 
-        ws_money.update(
-            f'C{row}:D{row}',
-            [[new_balance, "active"]]
-        )
+        # ✅ Update PG (nguồn chính)
+        pg_exec("""
+            UPDATE wallet
+            SET balance = %s, status = 'active', updated_at = NOW()
+            WHERE tele_id = %s
+        """, (new_balance, user_id))
 
-        # ✅ LOG riêng action
+        # ✅ Mirror Sheet (fire-and-forget)
+        if SHEET_READY:
+            try:
+                row = get_user_row(user_id)
+                if row:
+                    ws_money.update(f'C{row}:D{row}', [[new_balance, "active"]])
+            except Exception:
+                pass
+
+        # ✅ LOG
         log_row(
             user_id,
             username,
-            "ACTIVE_GIFT_CLICK",  # ← Riêng biệt với NEW_USER_BONUS
+            "ACTIVE_GIFT_CLICK",
             str(ACTIVE_GIFT_AMOUNT),
             f"Kích hoạt thủ công + nhận {ACTIVE_GIFT_AMOUNT:,}đ"
         )
-        
-        dprint(f"✅ User {user_id} activated: +{ACTIVE_GIFT_AMOUNT:,}đ → {new_balance:,}đ")
 
+        dprint(f"✅ User {user_id} activated: +{ACTIVE_GIFT_AMOUNT:,}đ → {new_balance:,}đ")
         return True, new_balance
 
     except Exception as e:
@@ -2583,8 +2539,8 @@ def handle_callback_query(cb):
             return
         
         # Check balance
-        row, balance, status = get_user_data(user_id)
-        if not row:
+        exists, balance, status = get_user_data(user_id)
+        if not exists:
             tg_answer_callback(cb_id, "❌ Bạn chưa có tài khoản", True)
             return
         
@@ -2734,8 +2690,8 @@ def handle_callback_query(cb):
         
         CALLBACK_COOLDOWN[user_id] = time.time()
 
-        row, balance, status = get_user_data(user_id)
-        if not row:
+        exists, balance, status = get_user_data(user_id)
+        if not exists:
             tg_answer_callback(cb_id, "❌ Bạn chưa có ID", True)
             return
 
@@ -3067,18 +3023,6 @@ def handle_update(update):
                 PROCESSED_MESSAGES.discard(old_msg)
             dprint(f"🗑️ Cleaned {len(old_msgs)} old messages from cache")
 
-    # ✅ CHECK SHEET_READY
-    if not SHEET_READY:
-        msg = update.get("message", {})
-        chat_id = msg.get("chat", {}).get("id")
-        if chat_id:
-            tg_send(
-                chat_id,
-                "⚠️ <b>Hệ thống đang bảo trì</b>\n"
-                "Vui lòng thử lại sau 2 phút."
-            )
-        return
-
     # ✅ CHECK BAN STATUS
     msg = update.get("message") or update.get("callback_query", {}).get("message", {})
     from_user = msg.get("from") or update.get("callback_query", {}).get("from", {})
@@ -3260,11 +3204,12 @@ def handle_update(update):
 
     # ===== /start =====
     if text == "/start":
-        # ✅ Check user mới
-        is_new_user = get_user_row(user_id) is None
-        
-        row = ensure_user_exists(user_id, username)
-        row, balance, status = get_user_data(user_id)
+        # ✅ Check user mới (PG-based)
+        r_check = pg_exec("SELECT tele_id FROM wallet WHERE tele_id=%s", (int(user_id),), fetchone=True) if PG_POOL else None
+        is_new_user = r_check is None
+
+        ensure_user_exists(user_id, username)
+        exists, balance, status = get_user_data(user_id)
 
         # ✅ Message cho user mới (đã AUTO active + 5100đ)
         if is_new_user:
@@ -3280,10 +3225,18 @@ def handle_update(update):
             )
             return
 
-        # ✅ User cũ - Auto fix status nếu chưa active
+        # ✅ User cũ - Auto fix status nếu chưa active (PG)
         if status != "active":
             try:
-                ws_money.update_cell(row, 4, "active")
+                pg_exec("UPDATE wallet SET status='active', updated_at=NOW() WHERE tele_id=%s", (int(user_id),))
+                # Mirror Sheet (fire-and-forget)
+                if SHEET_READY:
+                    try:
+                        row = get_user_row(user_id)
+                        if row:
+                            ws_money.update_cell(row, 4, "active")
+                    except Exception:
+                        pass
                 dprint(f"✅ Auto fixed status for user {user_id}: {status} → active")
                 status = "active"
             except Exception as e:
@@ -3328,8 +3281,8 @@ def handle_update(update):
         return
 
     # ===== USER DATA =====
-    row, balance, status = get_user_data(user_id)
-    if not row:
+    exists, balance, status = get_user_data(user_id)
+    if not exists:
         tg_send(chat_id, "❌ Bạn chưa có ID. Bấm /start để kích hoạt.")
         return
 
@@ -3343,10 +3296,9 @@ def handle_update(update):
         
         CALLBACK_COOLDOWN[f"balance_{user_id}"] = time.time()
         
-        # ✅ FORCE REFRESH - User có thể vừa nạp tiền
-        row, balance, status = get_user_data(user_id, force_refresh=True)
-        
-        if not row:
+        exists, balance, status = get_user_data(user_id)
+
+        if not exists:
             tg_send(chat_id, "❌ Không tìm thấy tài khoản. Bấm /start để kích hoạt.")
             return
         
@@ -3363,6 +3315,37 @@ def handle_update(update):
     # ===== LỊCH SỬ =====
     if text in ("📜 Lịch sử nạp tiền", "/topup_history"):
         tg_send(chat_id, topup_history_text(user_id))
+        return
+
+    # ===== LẤY PASS TOOL PC =====
+    if text == "🖥️ Lấy PASS Tool PC":
+        if PG_POOL is None:
+            tg_send(chat_id, "❌ Hệ thống đang lỗi. Thử lại sau.")
+            return
+
+        import secrets
+        new_pass = secrets.token_hex(8)  # 16 ký tự hex ngẫu nhiên
+
+        pg_exec("UPDATE wallet SET pass=%s, updated_at=NOW() WHERE tele_id=%s", (new_pass, int(user_id)))
+
+        # mirror sheet (fire-and-forget)
+        if SHEET_READY:
+            try:
+                row = get_user_row(user_id)
+                if row:
+                    # cột F (6) = pass
+                    ws_money.update_cell(row, 7, new_pass)
+            except Exception:
+                pass
+
+        tg_send(
+            chat_id,
+            f"🖥️ <b>PASS Tool PC</b>\n\n"
+            f"📋 <b>ID:</b> <code>{user_id}</code>\n"
+            f"🔐 <b>Pass:</b> <code>{new_pass}</code>\n\n"
+            f"⚡ <i>Pass mới được tạo mỗi lần bấm nút.\n"
+            f"Dùng ID + Pass này để login Tool PC.</i>"
+        )
         return
 
     # ===== HỆ THỐNG BOT =====
@@ -3454,13 +3437,13 @@ def handle_update(update):
         num_cookies = len(cookies)
         dprint(f"📊 Received {num_cookies} cookies")
 
-        # ✅ FORCE REFRESH BALANCE - User có thể vừa nạp tiền
-        row, balance, status = get_user_data(user_id, force_refresh=True)
-        if not row:
+        # ✅ Đọc balance từ PostgreSQL
+        exists, balance, status = get_user_data(user_id)
+        if not exists:
             tg_send(chat_id, "❌ Không tìm thấy ID")
             return
-        
-        dprint(f"💰 Balance after refresh: {balance:,}đ")
+
+        dprint(f"💰 Balance: {balance:,}đ")
 
         # ----- DYNAMIC COMBO -----
         if cmd.startswith("combo"):
@@ -3714,13 +3697,13 @@ def handle_update(update):
 
         num_cookies = len(cookies)
 
-        # ✅ FORCE REFRESH BALANCE - User có thể vừa nạp tiền
-        row, balance, status = get_user_data(user_id, force_refresh=True)
-        if not row:
+        # ✅ Đọc balance từ PostgreSQL
+        exists, balance, status = get_user_data(user_id)
+        if not exists:
             tg_send(chat_id, "❌ Không tìm thấy ID")
             return
-        
-        dprint(f"💰 Balance after refresh: {balance:,}đ")
+
+        dprint(f"💰 Balance: {balance:,}đ")
 
         v, err = get_voucher(cmd)
         if err:
@@ -3897,9 +3880,10 @@ def webhook():
 
 @app.route("/", methods=["GET"])
 def home():
-    if not SHEET_READY:
-        return "Bot running, Sheet ERROR", 500
-    return "Bot is running - V4 OPTIMIZED (90% Less API Calls)", 200
+    pg_ok = PG_POOL is not None
+    sheet_status = "Sheet OK" if SHEET_READY else "Sheet DOWN (non-critical)"
+    pg_status = "PG OK" if pg_ok else "PG DOWN (CRITICAL)"
+    return f"Bot is running V6 | {pg_status} | {sheet_status}", 200 if pg_ok else 503
 
 # =========================================================
 # LOCAL RUNNER
@@ -3907,7 +3891,7 @@ def home():
 if __name__ == "__main__":
     print("=" * 60)
     print(" NgânMiu.Store Telegram Bot")
-    print(" V4 - OPTIMIZED SHEET API CALLS (GIẢM 90%)")
+    print(" V7 - PG PRIMARY | Ban→status | Pass Tool PC")
     print("=" * 60)
     print("ADMIN_ID:", ADMIN_ID)
     print("SHEET_READY:", SHEET_READY)
