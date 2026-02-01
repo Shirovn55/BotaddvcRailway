@@ -3889,14 +3889,28 @@ def home():
 # 🛠️ TOOL API — PC Tool đọc/ghi ví qua HTTP
 # Bảo vệ bằng header X-Tool-Key
 # =========================================================
-TOOL_API_KEY = os.getenv("TOOL_API_KEY", "")
+TOOL_API_KEY = os.getenv("TOOL_API_KEY", "").strip()
 
 def _tool_auth():
     """Verify X-Tool-Key. Returns (True, None) hoặc (False, error_response)"""
     if not TOOL_API_KEY:
         return False, ({"ok": False, "error": "TOOL_API_KEY not configured on server"}, 500)
-    if request.headers.get("X-Tool-Key", "") != TOOL_API_KEY:
-        return False, ({"ok": False, "error": "Unauthorized"}, 401)
+    received = request.headers.get("X-Tool-Key", "").strip()
+    if received != TOOL_API_KEY:
+        print(f"[TOOL AUTH FAIL] received='{received}' ({len(received)}ch) expect='{TOOL_API_KEY}' ({len(TOOL_API_KEY)}ch) path={request.path}")
+        return False, ({"ok": False, "error": f"Unauthorized — server key {len(TOOL_API_KEY)}ch, received {len(received)}ch"}, 401)
+    return True, None
+
+@app.route("/tool/debug", methods=["GET"])
+def tool_debug():
+    """Temp debug — xem key server đang hold"""
+    k = TOOL_API_KEY
+    return {
+        "tool_api_key_len": len(k),
+        "tool_api_key_first3": k[:3],
+        "tool_api_key_last2": k[-2:] if len(k) >= 2 else k,
+        "tool_api_key_repr": repr(k)
+    }, 200
     return True, None
 
 
