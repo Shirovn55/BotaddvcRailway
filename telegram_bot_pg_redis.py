@@ -1023,7 +1023,7 @@ def auto_watch_qr_and_send_cookie(session_id, chat_id, user_id, username):
                 
                 # Cookie ST
                 if spc_st:
-                    msg += f"🍪 <b>Cookie ST:</b>\n<code>{spc_st}</code>\n\n"
+                    msg += f"🍪 <b>Cookie ST:</b>\n<code>SPC_ST={spc_st}</code>\n\n"
                 else:
                     msg += f"⚠️ <b>Cookie ST:</b> Không tìm thấy\n\n"
                 
@@ -1035,7 +1035,7 @@ def auto_watch_qr_and_send_cookie(session_id, chat_id, user_id, username):
                     if phone:
                         cookie_f_formatted += f" | {phone}"
                     
-                    msg += f"🔐 <b>Cookie F:</b>\n<code>{cookie_f_formatted}</code>\n\n"
+                    msg += f"🔐 <b>Cookie F:</b>\n<code>SPC_F={cookie_f_formatted}</code>\n\n"
                 else:
                     msg += f"⚠️ <b>Cookie F:</b> Không tìm thấy\n\n"
                 
