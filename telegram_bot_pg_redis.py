@@ -699,51 +699,12 @@ def check_qr_status(session_id):
     except Exception as e:
         return False, f"Error: {str(e)}", False, None, None
 
-def get_qr_cookie(session_id):
-    """Lấy cookie sau khi quét QR - CHỈ TRẢ COOKIE ST"""
-    dprint(f"[QR COOKIE] Getting cookie for session {session_id}")
-    
-    try:
-        url = f"{QR_API_BASE}/api/qr/login/{session_id}"
-        dprint(f"[QR COOKIE] URL: {url}")
-        
-        response = requests.post(url, timeout=10)
-        
-        dprint(f"[QR COOKIE] Status: {response.status_code}")
-
-        if response.status_code != 200:
-            dprint(f"[QR COOKIE] Error: HTTP {response.status_code}")
-            return False, f"API error: {response.status_code}"
-
-        data = response.json()
-        dprint(f"[QR COOKIE] Response: {data}")
-
-        if not data.get("success"):
-            error_msg = data.get("error", "Login failed")
-            dprint(f"[QR COOKIE] API error: {error_msg}")
-            return False, f"Login failed: {error_msg}"
-
-        # ✅ API trả "cookie" - lấy full cookie luôn
-        full_cookie = data.get("cookie", "")
-        
-        if not full_cookie:
-            dprint(f"[QR COOKIE] No cookie in response")
-            return False, "No cookie returned"
-        
-        dprint(f"[QR COOKIE] Got cookie: {full_cookie[:50]}...")
-        
-        return True, full_cookie
-
-    except Exception as e:
-        dprint(f"[QR COOKIE] Exception: {e}")
-        return False, f"Error: {str(e)}"
 
 def inline_qr_keyboard(session_id):
-    """Inline keyboard 2 nút ngang giống bot gốc"""
+    """Inline keyboard - CHỈ NÚT HỦY (Bot tự động lấy cookie)"""
     return {
         "inline_keyboard": [
             [
-                {"text": "🔄 Lấy Cookie", "callback_data": f"qr_check:{session_id}"},
                 {"text": "❌ Hủy", "callback_data": f"qr_cancel:{session_id}"}
             ]
         ]
@@ -929,9 +890,11 @@ def get_user_cookie(user_id):
             return None
         
         return cookie_data["cookie"]
-
 def handle_get_cookie_qr(chat_id, user_id, username):
-    """Xử lý lệnh Get Cookie QR - Y HỆT bot gốc"""
+    """
+    Xử lý lệnh Get Cookie QR
+    ✅ TỰ ĐỘNG WATCH - Không cần bấm nút
+    """
     # Check user tồn tại
     exists, balance, status = get_user_data(user_id)
     if not exists:
@@ -950,21 +913,28 @@ def handle_get_cookie_qr(chat_id, user_id, username):
 
     session_id = result
 
-    # Caption giống y bot gốc
+    # Caption hướng dẫn
     caption = (
         "🔑 <b>QR LOGIN SHOPEE</b>\n\n"
         "📍 <b>Hướng dẫn:</b>\n"
         "1️⃣ <b>Mở app Shopee</b>\n"
-        "2️⃣ <b>Ở Trang Chủ → Góc trên bên trái → Ô Vuông cạnh Shopee Pay</b>\n"
-        "3️⃣ <b>Bấm vào để Quét QR</b>\n"
-        "4️⃣ <b>Quét mã QR bên dưới</b>\n"
-        "5️⃣ <b>Quét xong bấm Lấy Cookie để nhận cookie</b>\n\n"
-        "⏰ Mã QR có hiệu lực trong <b>5 phút</b>"
+        "2️⃣ <b>Trang Chủ → Góc trên trái → Ô Vuông (Scanner)</b>\n"
+        "3️⃣ <b>Quét mã QR bên dưới</b>\n"
+        "4️⃣ <b>Chờ bot tự động lấy cookie</b> (không cần bấm gì)\n\n"
+        "⏰ Mã QR có hiệu lực trong <b>5 phút</b>\n"
+        "🤖 <i>Bot sẽ tự động gửi cookie sau khi bạn quét xong</i>"
     )
 
-    # Gửi QR với 2 nút ngang
+    # ✅ GỬI QR VỚI NÚT HỦY (không có nút Lấy Cookie)
+    cancel_keyboard = {
+        "inline_keyboard": [
+            [{"text": "❌ Hủy", "callback_data": f"qr_cancel:{session_id}"}]
+        ]
+    }
+
+    # Gửi QR
     try:
-        send_photo(chat_id, qr_image, caption=caption, reply_markup=inline_qr_keyboard(session_id))
+        send_photo(chat_id, qr_image, caption=caption, reply_markup=cancel_keyboard)
     except Exception as e:
         dprint(f"[QR] Send photo error: {e}")
         send_message(chat_id, f"{caption}\n\n❌ <b>Không thể tạo ảnh QR, vui lòng thử lại sau.</b>")
@@ -976,17 +946,28 @@ def handle_get_cookie_qr(chat_id, user_id, username):
             qr_sessions[session_id]["chat_id"] = chat_id
             qr_sessions[session_id]["username"] = username
 
-    # KHÔNG TỰ ĐỘNG CHECK - Chỉ check khi user bấm nút
-    dprint(f"[QR] Session {session_id} created, waiting for user action")
+    # ✅ START AUTO-WATCH THREAD
+    watch_thread = threading.Thread(
+        target=auto_watch_qr_and_send_cookie,
+        args=(session_id, chat_id, user_id, username),
+        daemon=True
+    )
+    watch_thread.start()
+    
+    dprint(f"[QR] Auto-watch started for session {session_id}")
 
+# =========================================================
+# 2. AUTO WATCH QR - TỰ ĐỘNG CHECK VÀ GỬI COOKIE
+# =========================================================
 def auto_watch_qr_and_send_cookie(session_id, chat_id, user_id, username):
     """
-    Tự động theo dõi QR và gửi cookie khi quét xong
-    ✅ Tối ưu: Chỉ check khi status thay đổi
+    ✅ TỰ ĐỘNG theo dõi QR và gửi cookie khi quét xong
+    ✅ Không cần user bấm nút
     """
-    dprint(f"[QR AUTO WATCH] Started for user {user_id}, session {session_id}")
+    dprint(f"[QR AUTO] Started watching session {session_id} for user {user_id}")
     
-    time.sleep(3)  # Delay 3s trước khi bắt đầu
+    # Delay 2s để user kịp thấy QR
+    time.sleep(2)
 
     start_time = time.time()
     check_count = 0
@@ -995,58 +976,54 @@ def auto_watch_qr_and_send_cookie(session_id, chat_id, user_id, username):
     while time.time() - start_time < QR_TIMEOUT:
         check_count += 1
         
-        # ✅ CHECK CANCELLED TRƯỚC
+        # ✅ CHECK CANCELLED
         with qr_lock:
             if session_id not in qr_sessions:
-                dprint(f"[QR AUTO WATCH] Session {session_id} cancelled, stopping")
+                dprint(f"[QR AUTO] Session {session_id} not found, stopping")
                 return
             
             session = qr_sessions.get(session_id, {})
             if session.get("cancelled"):
-                dprint(f"[QR AUTO WATCH] Session {session_id} marked as cancelled")
+                dprint(f"[QR AUTO] Session {session_id} cancelled by user")
                 return
         
+        # ✅ CHECK STATUS
         success, status, has_token, cookie_st, cookie_f = check_qr_status(session_id)
 
         if not success:
             time.sleep(QR_POLL_INTERVAL)
             continue
 
-        # ✅ CHỈ LOG KHI STATUS THAY ĐỔI (giảm spam log)
+        # ✅ LOG STATUS CHANGE
         if status != last_status:
-            dprint(f"[QR AUTO WATCH] Check #{check_count} - Status: {status}, has_token: {has_token}")
+            dprint(f"[QR AUTO] Check #{check_count} - Status: {status}, has_token: {has_token}")
             last_status = status
 
-        # Check nếu đã quét xong
-        if has_token and cookie_st:
-            dprint(f"[QR AUTO WATCH] QR scanned! Getting full cookie...")
+        # ✅ QUÉT XONG - LẤY COOKIE NGAY
+        if has_token:
+            dprint(f"[QR AUTO] QR confirmed! Getting full cookie...")
             
-            # Lấy cookie đầy đủ
-            success_login, cookie_st_full, cookie_f_full, user_info = get_qr_cookie(session_id)
+            # Gửi message "Đang lấy cookie..."
+            send_message(chat_id, "⏳ <b>Đang lấy cookie...</b>")
+            
+            # Lấy cookie
+            success_login, full_cookie = get_qr_cookie(session_id)
 
             if success_login:
-                dprint(f"[QR AUTO WATCH] Cookie retrieved successfully")
-                
-                # Tính ngày hết hạn
-                expiry_date = now_datetime() + timedelta(days=COOKIE_VALIDITY_DAYS)
-
-                # Format cookie
-                full_cookie = f"SPC_ST={cookie_st_full}; SPC_F={cookie_f_full};"
+                dprint(f"[QR AUTO] Cookie retrieved successfully")
                 
                 # Lưu cookie cho voucher nhanh
                 save_user_cookie(user_id, full_cookie)
 
-                # Username
-                username_display = ""
-                if user_info and user_info.get("username"):
-                    username_display = f"👤 <b>User:</b> {user_info['username']}\n\n"
+                # Tính ngày hết hạn
+                expiry_date = now_datetime() + timedelta(days=COOKIE_VALIDITY_DAYS)
 
-                # Gửi cookie
+                # ✅ GỬI COOKIE (Bao gồm cả SPC_F)
                 send_message(
                     chat_id,
                     "🎉 <b>LẤY COOKIE THÀNH CÔNG!</b>\n\n"
-                    f"{username_display}"
-                    f"🍪 <b>Cookie:</b>\n<code>{full_cookie}</code>\n\n"
+                    f"🍪 <b>Cookie (Full - Bao gồm SPC_F):</b>\n"
+                    f"<code>{full_cookie}</code>\n\n"
                     f"💡 <i>Tap vào cookie để auto copy</i>\n\n"
                     f"⏰ <b>Hiệu lực:</b> {COOKIE_VALIDITY_DAYS} ngày (đến {expiry_date.strftime('%d/%m/%Y')})\n"
                     f"⚠️ <b>Bảo mật tuyệt đối!</b>"
@@ -1061,19 +1038,31 @@ def auto_watch_qr_and_send_cookie(session_id, chat_id, user_id, username):
                     reply_markup=build_quick_save_keyboard()
                 )
                 
-                # Reset failure count khi thành công
+                # Reset failure count
                 with qr_failures_lock:
                     if user_id in qr_failures:
                         del qr_failures[user_id]
                 
+                # Xóa session
+                with qr_lock:
+                    if session_id in qr_sessions:
+                        del qr_sessions[session_id]
+                
+                dprint(f"[QR AUTO] Success! Session {session_id} completed")
                 return
             else:
-                dprint(f"[QR AUTO WATCH] Failed to get full cookie")
+                dprint(f"[QR AUTO] Failed to get cookie: {full_cookie}")
+                send_message(
+                    chat_id, 
+                    f"❌ <b>Lỗi lấy cookie</b>\n\n{full_cookie}",
+                    build_main_keyboard()
+                )
+                return
 
         time.sleep(QR_POLL_INTERVAL)
 
-    # Timeout
-    dprint(f"[QR AUTO WATCH] Timeout for session {session_id}")
+    # ✅ TIMEOUT
+    dprint(f"[QR AUTO] Timeout for session {session_id}")
     
     # Track failure
     is_banned = track_qr_failure(user_id, username, chat_id)
@@ -1094,86 +1083,102 @@ def auto_watch_qr_and_send_cookie(session_id, chat_id, user_id, username):
         send_message(
             chat_id,
             f"⏰ <b>HẾT THỜI GIAN</b>\n\n"
+            f"Mã QR đã hết hạn (5 phút)\n"
             f"Vui lòng Get Cookie QR lại{warning}",
             reply_markup=build_main_keyboard()
         )
-
-def handle_qr_check(chat_id, user_id, session_id):
-    """Xử lý callback Lấy Cookie"""
-    dprint(f"[QR CHECK] User {user_id} checking session {session_id}")
     
-    # ✅ GỬI MESSAGE "ĐANG LẤY COOKIE..."
-    send_message(chat_id, "⏳ <b>Đang lấy cookie...</b>")
-    
-    success, status, has_token, cookie_st, cookie_f = check_qr_status(session_id)
-    
-    dprint(f"[QR CHECK] check_qr_status result: success={success}, status={status}, has_token={has_token}")
+    # Xóa session
+    with qr_lock:
+        if session_id in qr_sessions:
+            del qr_sessions[session_id]
 
-    if not success:
-        dprint(f"[QR CHECK] Check failed: {status}")
-        send_message(chat_id, f"❌ <b>Lỗi:</b> {status}")
-        return
 
-    # ✅ Chỉ check has_token (API /status không trả cookie)
-    if has_token:
-        dprint(f"[QR CHECK] Has token, getting full cookie...")
+# =========================================================
+# 3. GET QR COOKIE - TRẢ FULL COOKIES (Bao gồm SPC_F)
+# =========================================================
+def get_qr_cookie(session_id):
+    """
+    Lấy cookie sau khi quét QR
+    Returns: (success: bool, full_cookie_with_spc_f: str)
+    
+    ✅ Trả FULL cookies bao gồm SPC_F
+    ✅ Priority: cookie_string → cookie → build from dict
+    """
+    dprint(f"[QR COOKIE] Getting cookie for session {session_id}")
+    
+    try:
+        url = f"{QR_API_BASE}/api/qr/login/{session_id}"
+        dprint(f"[QR COOKIE] URL: {url}")
         
-        # Lấy cookie - CHỈ TRẢ 2 GIÁ TRỊ
-        success_login, cookie = get_qr_cookie(session_id)
+        response = requests.post(url, timeout=10)
         
-        dprint(f"[QR CHECK] get_qr_cookie result: success={success_login}")
+        dprint(f"[QR COOKIE] Status: {response.status_code}")
 
-        if success_login:
-            dprint(f"[QR CHECK] Cookie retrieved successfully")
-            dprint(f"[QR CHECK] Cookie length: {len(cookie)}")
-            
-            # Lưu cookie cho voucher nhanh
-            save_user_cookie(user_id, cookie)
-            
-            # Tính ngày hết hạn
-            expiry_date = now_datetime() + timedelta(days=COOKIE_VALIDITY_DAYS)
+        if response.status_code != 200:
+            dprint(f"[QR COOKIE] Error: HTTP {response.status_code}")
+            return False, f"API error: {response.status_code}"
 
-            send_message(
-                chat_id,
-                "🎉 <b>LẤY COOKIE THÀNH CÔNG!</b>\n\n"
-                f"🍪 <b>Cookie:</b>\n<code>{cookie}</code>\n\n"
-                f"💡 <i>Tap vào cookie để auto copy</i>\n\n"
-                f"⏰ <b>Hiệu lực:</b> {COOKIE_VALIDITY_DAYS} ngày (đến {expiry_date.strftime('%d/%m/%Y')})\n"
-                f"⚠️ <b>Bảo mật tuyệt đối!</b>"
-            )
-            
-            # Gửi keyboard voucher nhanh
-            time.sleep(0.5)
-            send_message(
-                chat_id,
-                "⚡ <b>LƯU VOUCHER NHANH</b>\n\n"
-                "👇 Chọn voucher muốn lưu:",
-                reply_markup=build_quick_save_keyboard()
-            )
-            
-            # Xóa session
-            with qr_lock:
-                if session_id in qr_sessions:
-                    del qr_sessions[session_id]
-            
-            # Reset failure count
-            with qr_failures_lock:
-                if user_id in qr_failures:
-                    del qr_failures[user_id]
-        else:
-            dprint(f"[QR CHECK] Get cookie failed: {cookie}")
-            send_message(chat_id, f"❌ <b>Lỗi lấy cookie</b>\n\n{cookie}")
-    else:
-        dprint(f"[QR CHECK] Not ready - has_token={has_token}, cookie_st={cookie_st is not None}")
-        send_message(chat_id, f"⏳ <b>Trạng thái:</b> {status}\n\nVui lòng quét QR trong app Shopee")
+        data = response.json()
+        dprint(f"[QR COOKIE] Response keys: {list(data.keys())}")
 
+        if not data.get("success"):
+            error_msg = data.get("error", "Login failed")
+            dprint(f"[QR COOKIE] API error: {error_msg}")
+            return False, f"Login failed: {error_msg}"
+
+        # ✅ PRIORITY 1: cookie_string (full cookies)
+        full_cookie = data.get("cookie_string", "")
+        
+        # ✅ PRIORITY 2: cookie
+        if not full_cookie:
+            full_cookie = data.get("cookie", "")
+            dprint(f"[QR COOKIE] Using 'cookie' field")
+        
+        # ✅ PRIORITY 3: Build from cookies dict
+        if not full_cookie and data.get("cookies"):
+            try:
+                cookies_dict = data.get("cookies", {})
+                full_cookie = "; ".join([f"{k}={v}" for k, v in cookies_dict.items()])
+                dprint(f"[QR COOKIE] Built from dict: {len(cookies_dict)} cookies")
+            except Exception as e:
+                dprint(f"[QR COOKIE] Error building from dict: {e}")
+        
+        if not full_cookie:
+            dprint(f"[QR COOKIE] No cookie in response")
+            return False, "No cookie returned"
+        
+        # ✅ ENSURE SPC_F - Thêm SPC_F nếu chưa có
+        if "SPC_F=" not in full_cookie:
+            # SPC_F default từ Railway API (hoặc lấy từ create QR response)
+            default_spc_f = "YPByHuJJks2b7GpDwIdZp6ONQwyaN4yv"
+            full_cookie = f"{full_cookie}; SPC_F={default_spc_f}"
+            dprint(f"[QR COOKIE] Added default SPC_F")
+        
+        # Stats
+        cookie_count = full_cookie.count(";") + 1
+        has_spc_f = "SPC_F=" in full_cookie
+        dprint(f"[QR COOKIE] Success: {len(full_cookie)} chars, {cookie_count} cookies, SPC_F: {has_spc_f}")
+        dprint(f"[QR COOKIE] Preview: {full_cookie[:100]}...")
+        
+        return True, full_cookie
+
+    except Exception as e:
+        dprint(f"[QR COOKIE] Exception: {e}")
+        import traceback
+        dprint(f"[QR COOKIE] Traceback: {traceback.format_exc()}")
+        return False, f"Error: {str(e)}"
+
+
+# =========================================================
+# 4. HANDLE QR CANCEL - GIỮ NGUYÊN
+# =========================================================
 def handle_qr_cancel(chat_id, session_id):
     """Xử lý callback hủy QR"""
     dprint(f"[QR CANCEL] User cancelled session {session_id}")
     
     with qr_lock:
         if session_id in qr_sessions:
-            # Set cancelled flag để thread dừng
             qr_sessions[session_id]["cancelled"] = True
             dprint(f"[QR CANCEL] Marked session {session_id} as cancelled")
 
@@ -1182,6 +1187,8 @@ def handle_qr_cancel(chat_id, session_id):
         "❌ <b>ĐÃ HỦY</b>\n\nBấm <b>🔑 Get Cookie QR</b> để tạo mã mới",
         reply_markup=build_main_keyboard()
     )
+
+
 
 # =========================================================
 # UTIL
@@ -2509,11 +2516,6 @@ def handle_callback_query(cb):
     chat_id = cb.get("message", {}).get("chat", {}).get("id")
 
     # ===== QR CALLBACKS =====
-    if data.startswith("qr_check:"):
-        session_id = data.split(":", 1)[1]
-        tg_answer_callback(cb_id)
-        handle_qr_check(chat_id, user_id, session_id)
-        return
 
     if data.startswith("qr_cancel:"):
         session_id = data.split(":", 1)[1]
