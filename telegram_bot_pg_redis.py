@@ -1006,8 +1006,8 @@ def auto_watch_qr_and_send_cookie(session_id, chat_id, user_id, username):
             # Gửi message "Đang lấy cookie..."
             send_message(chat_id, "⏳ <b>Đang lấy cookie...</b>")
             
-            # Lấy cookie
-            success_login, full_cookie = get_qr_cookie(session_id)
+            # ✅ LẤY COOKIE - TRẢ 6 GIÁ TRỊ
+            success_login, full_cookie, spc_st, spc_f, username, phone = get_qr_cookie(session_id)
 
             if success_login:
                 dprint(f"[QR AUTO] Cookie retrieved successfully")
@@ -1018,16 +1018,33 @@ def auto_watch_qr_and_send_cookie(session_id, chat_id, user_id, username):
                 # Tính ngày hết hạn
                 expiry_date = now_datetime() + timedelta(days=COOKIE_VALIDITY_DAYS)
 
-                # ✅ GỬI COOKIE (Bao gồm cả SPC_F)
-                send_message(
-                    chat_id,
-                    "🎉 <b>LẤY COOKIE THÀNH CÔNG!</b>\n\n"
-                    f"🍪 <b>Cookie (Full - Bao gồm SPC_F):</b>\n"
-                    f"<code>{full_cookie}</code>\n\n"
-                    f"💡 <i>Tap vào cookie để auto copy</i>\n\n"
-                    f"⏰ <b>Hiệu lực:</b> {COOKIE_VALIDITY_DAYS} ngày (đến {expiry_date.strftime('%d/%m/%Y')})\n"
-                    f"⚠️ <b>Bảo mật tuyệt đối!</b>"
-                )
+                # ✅ GỬI COOKIE - CHỈ HIỂN THỊ ST VÀ F RIÊNG 2 DÒNG
+                msg = "🎉 <b>LẤY COOKIE THÀNH CÔNG!</b>\n\n"
+                
+                # Cookie ST
+                if spc_st:
+                    msg += f"🍪 <b>Cookie ST:</b>\n<code>{spc_st}</code>\n\n"
+                else:
+                    msg += f"⚠️ <b>Cookie ST:</b> Không tìm thấy\n\n"
+                
+                # Cookie F (format: SPC_F | username | SDT)
+                if spc_f:
+                    cookie_f_formatted = spc_f
+                    if username:
+                        cookie_f_formatted += f" | {username}"
+                    if phone:
+                        cookie_f_formatted += f" | {phone}"
+                    
+                    msg += f"🔐 <b>Cookie F:</b>\n<code>{cookie_f_formatted}</code>\n\n"
+                else:
+                    msg += f"⚠️ <b>Cookie F:</b> Không tìm thấy\n\n"
+                
+                # Thông tin thêm
+                msg += f"💡 <i>Tap vào cookie để auto copy</i>\n\n"
+                msg += f"⏰ <b>Hiệu lực:</b> {COOKIE_VALIDITY_DAYS} ngày (đến {expiry_date.strftime('%d/%m/%Y')})\n"
+                msg += f"⚠️ <b>Bảo mật tuyệt đối!</b>"
+                
+                send_message(chat_id, msg)
                 
                 # Gửi keyboard voucher nhanh
                 time.sleep(0.5)
@@ -1100,9 +1117,9 @@ def auto_watch_qr_and_send_cookie(session_id, chat_id, user_id, username):
 def get_qr_cookie(session_id):
     """
     Lấy cookie sau khi quét QR
-    Returns: (success: bool, full_cookie_with_spc_f: str)
+    Returns: (success: bool, full_cookie: str, spc_st: str, spc_f: str, username: str, phone: str)
     
-    ✅ Trả FULL cookies bao gồm SPC_F
+    ✅ Trả RIÊNG: full_cookie, SPC_ST, SPC_F, username, phone
     ✅ Priority: cookie_string → cookie → build from dict
     """
     dprint(f"[QR COOKIE] Getting cookie for session {session_id}")
@@ -1117,7 +1134,7 @@ def get_qr_cookie(session_id):
 
         if response.status_code != 200:
             dprint(f"[QR COOKIE] Error: HTTP {response.status_code}")
-            return False, f"API error: {response.status_code}"
+            return False, f"API error: {response.status_code}", "", "", "", ""
 
         data = response.json()
         dprint(f"[QR COOKIE] Response keys: {list(data.keys())}")
@@ -1125,7 +1142,7 @@ def get_qr_cookie(session_id):
         if not data.get("success"):
             error_msg = data.get("error", "Login failed")
             dprint(f"[QR COOKIE] API error: {error_msg}")
-            return False, f"Login failed: {error_msg}"
+            return False, f"Login failed: {error_msg}", "", "", "", ""
 
         # ✅ PRIORITY 1: cookie_string (full cookies)
         full_cookie = data.get("cookie_string", "")
@@ -1146,28 +1163,58 @@ def get_qr_cookie(session_id):
         
         if not full_cookie:
             dprint(f"[QR COOKIE] No cookie in response")
-            return False, "No cookie returned"
+            return False, "No cookie returned", "", "", "", ""
         
         # ✅ ENSURE SPC_F - Thêm SPC_F nếu chưa có
         if "SPC_F=" not in full_cookie:
-            # SPC_F default từ Railway API (hoặc lấy từ create QR response)
             default_spc_f = "YPByHuJJks2b7GpDwIdZp6ONQwyaN4yv"
             full_cookie = f"{full_cookie}; SPC_F={default_spc_f}"
             dprint(f"[QR COOKIE] Added default SPC_F")
         
+        # ✅ EXTRACT SPC_ST
+        spc_st = ""
+        match_st = re.search(r'SPC_ST=([^;]+)', full_cookie)
+        if match_st:
+            spc_st = match_st.group(1)
+            dprint(f"[QR COOKIE] Extracted SPC_ST: {spc_st[:30]}...")
+        
+        # ✅ EXTRACT SPC_F
+        spc_f = ""
+        match_f = re.search(r'SPC_F=([^;]+)', full_cookie)
+        if match_f:
+            spc_f = match_f.group(1)
+            dprint(f"[QR COOKIE] Extracted SPC_F: {spc_f}")
+        
+        # ✅ EXTRACT USERNAME VÀ PHONE từ API response
+        username = data.get("username", "")
+        phone = data.get("phone", "")
+        
+        # Fallback: nếu không có trong response, cố gắng decode từ cookie
+        if not username or not phone:
+            try:
+                # Có thể có thông tin trong cookies dict
+                cookies_dict = data.get("cookies", {})
+                if not username:
+                    username = cookies_dict.get("username", "")
+                if not phone:
+                    phone = cookies_dict.get("phone", "")
+            except Exception:
+                pass
+        
+        dprint(f"[QR COOKIE] Username: {username}, Phone: {phone}")
+        
         # Stats
         cookie_count = full_cookie.count(";") + 1
-        has_spc_f = "SPC_F=" in full_cookie
-        dprint(f"[QR COOKIE] Success: {len(full_cookie)} chars, {cookie_count} cookies, SPC_F: {has_spc_f}")
-        dprint(f"[QR COOKIE] Preview: {full_cookie[:100]}...")
+        dprint(f"[QR COOKIE] Success: {len(full_cookie)} chars, {cookie_count} cookies")
+        dprint(f"[QR COOKIE] SPC_ST: {len(spc_st)} chars, SPC_F: {len(spc_f)} chars")
         
-        return True, full_cookie
+        return True, full_cookie, spc_st, spc_f, username, phone
 
     except Exception as e:
         dprint(f"[QR COOKIE] Exception: {e}")
         import traceback
         dprint(f"[QR COOKIE] Traceback: {traceback.format_exc()}")
-        return False, f"Error: {str(e)}"
+        return False, f"Error: {str(e)}", "", "", "", ""
 
 
 # =========================================================
