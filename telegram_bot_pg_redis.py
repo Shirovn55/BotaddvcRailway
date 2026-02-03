@@ -612,7 +612,7 @@ def build_main_keyboard(is_active=True):
         "keyboard": [
             ["💎 Nạp tiền", "💰 Số dư"],
             ["🎁 Lưu Voucher", "🔑 Get Cookie QR"],
-            ["🖥️ Tải Tool ADD Voucher PC"],
+            ["🖥️ Tải & Lấy Pass Tool ADD PC"],
             ["🧩 Hệ Thống Bot"]
         ],
         "resize_keyboard": True
@@ -3395,8 +3395,8 @@ def handle_update(update):
         tg_send(chat_id, topup_history_text(user_id))
         return
 
-    # ===== TẢI TOOL ADD VOUCHER PC =====
-    if text == "🖥️ Tải Tool ADD Voucher PC":
+    # ===== TẢI & LẤY PASS TOOL ADD PC =====
+    if text == "🖥️ Tải & Lấy Pass Tool ADD PC":
         if PG_POOL is None:
             tg_send(chat_id, "❌ Hệ thống đang lỗi. Thử lại sau.")
             return
@@ -3423,7 +3423,7 @@ def handle_update(update):
             f"🔐 <b>Password:</b> <code>{new_pass}</code>\n\n"
             f"━━━━━━━━━━━━━━━━━━\n\n"
             f"📥 <b>TẢI TOOL:</b>\n"
-            f"🔗 <a href='https://t.me/botxshopee/2555'>Tải ToolADDPC.exe (56.4 MB)</a>\n\n"
+            f"🔗 <a href='https://t.me/botxshopee/2580'>Tải ToolADDPC.exe (56.4 MB)</a>\n\n"
             f"━━━━━━━━━━━━━━━━━━\n\n"
             f"📖 <b>HƯỚNG DẪN SỬ DỤNG:</b>\n"
             f"1️⃣ Bấm link bên trên để tải file\n"
