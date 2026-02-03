@@ -612,7 +612,7 @@ def build_main_keyboard(is_active=True):
         "keyboard": [
             ["💎 Nạp tiền", "💰 Số dư"],
             ["🎁 Lưu Voucher", "🔑 Get Cookie QR"],
-            ["🖥️ Lấy PASS Tool PC"],
+            ["🖥️ Tải Tool ADD Voucher PC"],
             ["🧩 Hệ Thống Bot"]
         ],
         "resize_keyboard": True
@@ -3395,8 +3395,8 @@ def handle_update(update):
         tg_send(chat_id, topup_history_text(user_id))
         return
 
-    # ===== LẤY PASS TOOL PC =====
-    if text == "🖥️ Lấy PASS Tool PC":
+    # ===== TẢI TOOL ADD VOUCHER PC =====
+    if text == "🖥️ Tải Tool ADD Voucher PC":
         if PG_POOL is None:
             tg_send(chat_id, "❌ Hệ thống đang lỗi. Thử lại sau.")
             return
@@ -3411,19 +3411,39 @@ def handle_update(update):
             try:
                 row = get_user_row(user_id)
                 if row:
-                    # cột F (6) = pass
+                    # cột 7 = pass
                     ws_money.update_cell(row, 7, new_pass)
             except Exception:
                 pass
 
         tg_send(
             chat_id,
-            f"🖥️ <b>PASS Tool PC</b>\n\n"
-            f"📋 <b>ID:</b> <code>{user_id}</code>\n"
-            f"🔐 <b>Pass:</b> <code>{new_pass}</code>\n\n"
-            f"⚡ <i>Pass mới được tạo mỗi lần bấm nút.\n"
-            f"Dùng ID + Pass này để login Tool PC.</i>"
+            f"🖥️ <b>TOOL ADD VOUCHER PC</b>\n\n"
+            f"📋 <b>Telegram ID:</b> <code>{user_id}</code>\n"
+            f"🔐 <b>Password:</b> <code>{new_pass}</code>\n\n"
+            f"━━━━━━━━━━━━━━━━━━\n\n"
+            f"📥 <b>TẢI TOOL:</b>\n"
+            f"🔗 <a href='https://t.me/botxshopee/2555'>Tải ToolADDPC.exe (56.4 MB)</a>\n\n"
+            f"━━━━━━━━━━━━━━━━━━\n\n"
+            f"📖 <b>HƯỚNG DẪN SỬ DỤNG:</b>\n"
+            f"1️⃣ Bấm link bên trên để tải file\n"
+            f"2️⃣ Chạy ToolADDPC.exe\n"
+            f"3️⃣ Nhập Telegram ID + Password (copy bên trên)\n"
+            f"4️⃣ Bấm LOGIN và bắt đầu lưu voucher\n\n"
+            f"💡 <b>Tính năng:</b>\n"
+            f"• Lưu nhiều voucher cùng lúc\n"
+            f"• Hỗ trợ nhiều cookie\n"
+            f"• Get Cookie QR ngay trong tool\n"
+            f"• Tự động trừ tiền từ số dư bot\n\n"
+            f"⚠️ <b>Lưu ý:</b>\n"
+            f"• Windows có thể cảnh báo → Bấm 'Run anyway'\n"
+            f"• Mỗi lần bấm nút sẽ tạo Password mới\n"
+            f"• Tool chỉ chạy trên Windows 10/11\n\n"
+            f"❓ Cần hỗ trợ? → @BonBonxHPx"
         )
+        
+        # Log download
+        log_row(user_id, username, "GET_TOOL_INFO", "0", f"Lấy thông tin Tool PC | Pass: {new_pass[:4]}***")
         return
 
     # ===== HỆ THỐNG BOT =====
