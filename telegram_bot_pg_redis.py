@@ -1012,6 +1012,33 @@ def auto_watch_qr_and_send_cookie(session_id, chat_id, user_id, username):
             if success_login:
                 dprint(f"[QR AUTO] Cookie retrieved successfully")
                 
+                # ✅ TRỪ 100Đ KHI GET QR THÀNH CÔNG
+                QR_FEE = 100  # Phí Get QR
+                success_deduct, new_balance = deduct_balance_atomic(user_id, QR_FEE)
+                
+                if not success_deduct:
+                    # Không đủ tiền
+                    send_message(
+                        chat_id,
+                        f"❌ <b>KHÔNG ĐỦ SỐ DƯ</b>\n\n"
+                        f"💰 Cần: <b>{QR_FEE:,}đ</b>\n"
+                        f"💼 Số dư: <b>{new_balance:,}đ</b>\n\n"
+                        f"⚠️ Vui lòng nạp tiền để sử dụng tính năng Get QR",
+                        reply_markup=build_main_keyboard()
+                    )
+                    
+                    # Xóa session
+                    with qr_lock:
+                        if session_id in qr_sessions:
+                            del qr_sessions[session_id]
+                    
+                    dprint(f"[QR AUTO] Insufficient balance for user {user_id}")
+                    return
+                
+                # Ghi log trừ tiền
+                log_row(user_id, username, "GET_QR", f"-{QR_FEE}", f"Phí Get Cookie QR | Balance: {new_balance:,}đ")
+                dprint(f"[QR AUTO] Deducted {QR_FEE}đ from user {user_id}, new balance: {new_balance:,}đ")
+                
                 # Lưu cookie cho voucher nhanh
                 save_user_cookie(user_id, full_cookie)
 
@@ -1020,6 +1047,8 @@ def auto_watch_qr_and_send_cookie(session_id, chat_id, user_id, username):
 
                 # ✅ GỬI COOKIE - CHỈ HIỂN THỊ ST VÀ F RIÊNG 2 DÒNG
                 msg = "🎉 <b>LẤY COOKIE THÀNH CÔNG!</b>\n\n"
+                msg += f"💸 <b>Đã trừ:</b> {QR_FEE:,}đ\n"
+                msg += f"💼 <b>Số dư:</b> {new_balance:,}đ\n\n"
                 
                 # Cookie ST
                 if spc_st:
