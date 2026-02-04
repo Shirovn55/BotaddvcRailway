@@ -9,6 +9,7 @@ NgânMiu.Store — Telegram Bot
 ✅ Retry logic (tăng stability)
 ✅ ⭐ HỖ TRỢ LƯU TỐI ĐA 10 COOKIE CÙNG LÚC ⭐
 ✅ 🔥 ROW CACHE + BROADCAST CACHE - GIẢM 90% SHEET CALLS 🔥
+✅ 🎯 BROADCAST FIX (2025-02-04) - LẤY USER TỪ POSTGRESQL THAY VÌ CHỈ CACHE 🎯
 """
 
 import os
@@ -1277,41 +1278,66 @@ def now_datetime():
 
 def get_all_user_ids():
     """
-    ✅ V4: Cache broadcast user list, ưu tiên dùng USER_ROW_CACHE
+    🎯 V7 BROADCAST FIX:
+    - Ưu tiên lấy TẤT CẢ user từ PostgreSQL (nguồn chính)
+    - Cache kết quả 5 phút để giảm DB load
+    - Fallback: Sheet (nếu PG fail) hoặc cache cũ
+    
+    ✅ FIX: Trước đây chỉ dùng USER_ROW_CACHE + Sheet
+    → Bỏ sót user mới chưa chat với bot!
     """
     global BROADCAST_USER_CACHE, BROADCAST_USER_CACHE_TIME
 
-    if not SHEET_READY:
-        return []
-
-    # ✅ CHECK CACHE TRƯỚC
+    # ✅ CHECK CACHE TRƯỚC (TTL 5 phút)
     now = time.time()
     if (BROADCAST_USER_CACHE and
         now - BROADCAST_USER_CACHE_TIME < BROADCAST_USER_CACHE_TTL):
         dprint(f"✅ BROADCAST CACHE HIT: {len(BROADCAST_USER_CACHE)} users")
         return BROADCAST_USER_CACHE
 
-    # ❌ Cache miss
-    dprint("⚠️ BROADCAST CACHE MISS...")
+    # ❌ Cache miss - cần fetch mới
+    dprint("⚠️ BROADCAST CACHE MISS - Fetching from database...")
 
     try:
-        # ✅ ƯU TIÊN DÙNG USER_ROW_CACHE (không gọi Sheet)
-        cached_users = list(USER_ROW_CACHE.keys())
-        if len(cached_users) > 10:
-            dprint(f"✅ Using {len(cached_users)} users from ROW_CACHE")
-            BROADCAST_USER_CACHE = cached_users
-            BROADCAST_USER_CACHE_TIME = now
-            return cached_users
+        # 🎯 PRIORITY 1: LẤY TỪ POSTGRESQL (NGUỒN CHÍNH)
+        if PG_POOL is not None:
+            rows = pg_exec(
+                "SELECT tele_id FROM wallet WHERE status NOT IN ('banned', 'banned_qr_spam')",
+                fetchall=True
+            )
+            if rows:
+                user_ids = [int(r[0]) for r in rows]
+                BROADCAST_USER_CACHE = user_ids
+                BROADCAST_USER_CACHE_TIME = now
+                dprint(f"✅ Loaded {len(user_ids)} users from PostgreSQL")
+                return user_ids
+            else:
+                dprint("⚠️ PostgreSQL query returned 0 users")
+        else:
+            dprint("⚠️ PG_POOL is None, falling back to Sheet")
 
-        # ❌ Fallback: đọc từ Sheet
-        dprint("⚠️ Reading all users from Sheet...")
+        # 🔄 FALLBACK 1: Dùng USER_ROW_CACHE nếu không có Sheet
+        if not SHEET_READY:
+            dprint("❌ Sheet not ready, using ROW_CACHE only")
+            cached_users = list(USER_ROW_CACHE.keys())
+            if len(cached_users) > 0:
+                BROADCAST_USER_CACHE = cached_users
+                BROADCAST_USER_CACHE_TIME = now
+                return cached_users
+            return []
+
+        # 🔄 FALLBACK 2: Đọc từ Google Sheet
+        dprint("⚠️ Reading all users from Sheet (fallback)...")
         all_values = ws_money.get_all_values()
         user_ids = set()
-        for row in all_values[1:]:
+        for row in all_values[1:]:  # Skip header
             if row and row[0]:
                 try:
                     user_id = int(row[0])
-                    user_ids.add(user_id)
+                    # Lọc status ban (cột 4)
+                    status = row[3].strip().lower() if len(row) > 3 else ""
+                    if status not in ("banned", "banned_qr_spam"):
+                        user_ids.add(user_id)
                 except:
                     continue
 
@@ -1321,10 +1347,12 @@ def get_all_user_ids():
 
         dprint(f"📊 Loaded {len(result)} users from Sheet")
         return result
+
     except Exception as e:
-        dprint("get_all_user_ids error:", e)
+        dprint(f"❌ get_all_user_ids error: {e}")
+        # 🔄 FALLBACK 3: Dùng cache cũ nếu có lỗi
         if BROADCAST_USER_CACHE:
-            dprint("⚠️ Using stale cache due to error")
+            dprint(f"⚠️ Using stale cache ({len(BROADCAST_USER_CACHE)} users) due to error")
             return BROADCAST_USER_CACHE
         return []
 
