@@ -710,8 +710,11 @@ def check_one_voucher(voucher, cookie):
         if data.get('error') == 0:
             info = data['data']['voucher_basic_info']
             
+            # ✅ Dùng display_name thay vì code
+            display_name = voucher.get('display_name', voucher['code'])
+            
             # Build message
-            msg = f"🎫 <b>{info['voucher_code']}</b>\n"
+            msg = f"🎫 <b>{display_name}</b>\n"
 
             # Discount info
             if info.get('discount_percentage') and info.get('discount_percentage') > 0:
@@ -746,24 +749,25 @@ def check_one_voucher(voucher, cookie):
 
             # End time
             end_time = datetime.fromtimestamp(info['end_time']).strftime('%H:%M:%S %d/%m/%Y')
-            msg += f"⏰ Hạn: {end_time}\n"
-            msg += "─" * 25
+            msg += f"⏰ Hạn: {end_time}"
 
             return (True, msg)
         else:
             err_code = data.get('error')
-            msg = f"❌ {voucher['code']}: Lỗi API ({err_code})"
+            display_name = voucher.get('display_name', voucher['code'])
+            msg = f"❌ {display_name}: Lỗi API ({err_code})"
             return (False, msg)
 
     except Exception as e:
-        msg = f"❌ {voucher['code']}: Lỗi kết nối ({str(e)[:30]})"
+        display_name = voucher.get('display_name', voucher['code'])
+        msg = f"❌ {display_name}: Lỗi kết nối ({str(e)[:30]})"
         return (False, msg)
 
 
 def get_vouchers_from_stock():
     """
     Lấy danh sách voucher từ VoucherStock sheet
-    Trả về: list of dict {"code": str, "promotionid": int, "signature": str}
+    Trả về: list of dict {"code": str, "promotionid": int, "signature": str, "display_name": str}
     """
     if not SHEET_READY or ws_voucher is None:
         return []
@@ -775,6 +779,8 @@ def get_vouchers_from_stock():
         return []
 
     voucher_list = []
+    seen_codes = set()  # ✅ Chống duplicate
+    
     for row in rows:
         # Flexible column mapping
         def _get(*keys):
@@ -788,16 +794,21 @@ def get_vouchers_from_stock():
         code = _get("code", "code_name", "voucher_code")
         promo_id = _get("promotion_id", "promotionid")
         sig = _get("signature", "chữ ký", "chu ky")
+        display_name = _get("display_name", "display name", "ten_ma", "tên mã", "displayname")
 
         if code and promo_id:
-            try:
-                voucher_list.append({
-                    "code": code,
-                    "promotionid": int(promo_id),
-                    "signature": sig
-                })
-            except ValueError:
-                continue
+            # ✅ Chống duplicate: Chỉ thêm nếu code chưa có
+            if code not in seen_codes:
+                try:
+                    voucher_list.append({
+                        "code": code,
+                        "promotionid": int(promo_id),
+                        "signature": sig,
+                        "display_name": display_name or code  # Fallback về code nếu không có display_name
+                    })
+                    seen_codes.add(code)
+                except ValueError:
+                    continue
 
     return voucher_list
 
@@ -819,7 +830,7 @@ def handle_check_voucher(user_id, username):
         return
 
     # 2. Lấy danh sách voucher từ VoucherStock
-    tg_send(user_id, "🔄 Đang tải danh sách voucher...")
+    tg_send(user_id, f"📊 Đang tải danh sách voucher...")
     vouchers = get_vouchers_from_stock()
 
     if not vouchers:
@@ -830,41 +841,49 @@ def handle_check_voucher(user_id, username):
         )
         return
 
-    # 3. Check từng voucher
-    tg_send(user_id, f"📊 Tìm thấy {len(vouchers)} voucher. Bắt đầu check...\n")
-    
+    # 3. Check từng voucher (không gửi từng batch)
     results = []
-    success_count = 0
-    fail_count = 0
-
-    for idx, voucher in enumerate(vouchers):
+    
+    for voucher in vouchers:
         success, msg = check_one_voucher(voucher, cookie)
-        
-        if success:
-            success_count += 1
-        else:
-            fail_count += 1
-            
         results.append(msg)
+        time.sleep(0.3)  # Tránh spam API
 
-        # Gửi từng kết quả (tránh message quá dài)
-        if (idx + 1) % 3 == 0 or idx == len(vouchers) - 1:
-            batch_msg = "\n\n".join(results[-3:])
-            tg_send(user_id, batch_msg)
-            time.sleep(0.5)  # Tránh spam
+    # 4. Gửi tất cả kết quả trong 1 message duy nhất
+    final_message = "\n\n".join(results)
+    
+    # Split nếu quá dài (Telegram limit 4096 chars)
+    if len(final_message) > 4000:
+        # Chia thành nhiều message nếu quá dài
+        chunks = []
+        current_chunk = []
+        current_length = 0
+        
+        for result in results:
+            result_length = len(result) + 2  # +2 cho \n\n
+            if current_length + result_length > 4000:
+                chunks.append("\n\n".join(current_chunk))
+                current_chunk = [result]
+                current_length = result_length
+            else:
+                current_chunk.append(result)
+                current_length += result_length
+        
+        if current_chunk:
+            chunks.append("\n\n".join(current_chunk))
+        
+        # Gửi từng chunk
+        for chunk in chunks:
+            tg_send(user_id, chunk)
+            time.sleep(0.5)
+    else:
+        # Gửi 1 message duy nhất
+        tg_send(user_id, final_message, build_main_keyboard())
 
-    # 4. Tổng kết
-    summary = (
-        f"\n\n{'='*30}\n"
-        f"📊 <b>TỔNG KẾT</b>\n"
-        f"✅ Thành công: {success_count}\n"
-        f"❌ Thất bại: {fail_count}\n"
-        f"📦 Tổng: {len(vouchers)}\n"
-        f"{'='*30}"
-    )
-    tg_send(user_id, summary, build_main_keyboard())
-
-    # 5. Log
+    # 5. Log (không hiển thị tổng kết cho user)
+    success_count = sum(1 for r in results if not r.startswith("❌"))
+    fail_count = len(results) - success_count
+    
     if SHEET_READY and ws_log:
         try:
             ws_log.append_row([
