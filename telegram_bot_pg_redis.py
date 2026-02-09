@@ -735,12 +735,15 @@ def check_one_voucher(voucher, cookie):
             else:
                 msg += f"📊 Đã dùng: {used}% 🟢\n"
 
-            # Claimed percentage
-            claimed = info.get('percentage_claimed', 0)
-            if claimed >= 100:
+            # Check lượt lưu bằng left_count (chính xác)
+            left_count = info.get('left_count', -1)
+            if left_count == 0:
                 msg += "📥 Lượt lưu: Đã hết lượt ⛔\n"
+            elif left_count > 0:
+                msg += f"📥 Lượt lưu: Còn {left_count} lượt ✅\n"
             else:
-                msg += "📥 Lượt lưu: Còn lượt ✅\n"
+                # left_count = -1 hoặc None → Không giới hạn
+                msg += "📥 Lượt lưu: Không giới hạn ✅\n"
 
             # End time
             end_time = datetime.fromtimestamp(info['end_time']).strftime('%H:%M:%S %d/%m/%Y')
