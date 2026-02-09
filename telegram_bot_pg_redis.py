@@ -17,6 +17,7 @@ import json
 import re
 import unicodedata
 import requests
+import random  # ✅ THÊM RANDOM CHO CHECK VOUCHER
 from datetime import datetime, timedelta, timezone
 from flask import Flask, request
 
@@ -286,6 +287,7 @@ ws_money    = None
 ws_voucher  = None
 ws_log      = None
 ws_nap_tien = None
+ws_cookies  = None  # ✅ TAB COOKIE CHO CHECK VOUCHER
 
 scope = [
     "https://spreadsheets.google.com/feeds",
@@ -327,6 +329,14 @@ while retry_count < MAX_RETRIES and not connected:
         except Exception as e:
             ws_nap_tien = None
             print(f"⚠️ Nap Tien tab not found: {e}")
+
+        # ✅ Load tab Cookie cho chức năng Check Voucher
+        try:
+            ws_cookies = sh.worksheet("Cookie")
+            print(f"✅ Step 6: Cookie tab loaded ({time.time()-start_time:.2f}s)")
+        except Exception as e:
+            ws_cookies = None
+            print(f"⚠️ Cookie tab not found: {e}")
 
         SHEET_READY = True
         connected = True
@@ -612,12 +622,290 @@ def build_main_keyboard(is_active=True):
     return {
         "keyboard": [
             ["💎 Nạp tiền", "💰 Số dư"],
-            ["🎁 Lưu Voucher", "🔑 Get Cookie QR"],
+            ["🎁 Lưu Voucher", "📊 Check Voucher"],  # ✅ THÊM NÚT CHECK VOUCHER
+            ["🔑 Get Cookie QR"],
             ["🖥️ Tải & Lấy Pass Tool ADD PC"],
             ["🧩 Hệ Thống Bot"]
         ],
         "resize_keyboard": True
     }
+
+# =========================================================
+# 📊 CHECK VOUCHER FUNCTIONS
+# =========================================================
+def get_cookie_from_sheet():
+    """
+    Lấy cookie ngẫu nhiên từ tab Cookie trong Google Sheet
+    Trả về cookie string hoặc None nếu không có
+    """
+    if not SHEET_READY or ws_cookies is None:
+        return None
+    
+    try:
+        # Lấy tất cả giá trị từ cột A (Cookie)
+        cookie_column = ws_cookies.col_values(1)
+        
+        # Bỏ qua header (dòng 1) và filter cookie hợp lệ
+        valid_cookies = []
+        for i, cell in enumerate(cookie_column):
+            if i == 0:  # Skip header
+                continue
+            
+            cell_str = str(cell).strip()
+            # Cookie phải chứa "SPC_ST" và đủ dài
+            if cell_str and "SPC_ST" in cell_str and len(cell_str) > 50:
+                valid_cookies.append(cell_str)
+        
+        if not valid_cookies:
+            dprint("❌ Không tìm thấy cookie hợp lệ trong tab Cookie")
+            return None
+        
+        # Random pick 1 cookie
+        selected_cookie = random.choice(valid_cookies)
+        dprint(f"✅ Đã chọn cookie: {selected_cookie[:50]}...")
+        return selected_cookie
+        
+    except Exception as e:
+        dprint(f"get_cookie_from_sheet error: {e}")
+        return None
+
+
+def format_currency_check(value):
+    """Format số tiền theo định dạng VN"""
+    if not value: 
+        return "0đ"
+    value = float(value)
+    if value > 100000000: 
+        value = value / 100000
+    return "{:,.0f}đ".format(value).replace(",", ".")
+
+
+def check_one_voucher(voucher, cookie):
+    """
+    Check 1 voucher và trả về thông tin formatted
+    Trả về: (success: bool, message: str)
+    """
+    url = "https://shopee.vn/api/v2/voucher_wallet/get_voucher_detail"
+    
+    headers = {
+        'User-Agent': 'Android app Shopee appver=28320 app_type=1',
+        'Cookie': cookie,
+        'Content-Type': 'application/json'
+    }
+
+    payload = {
+        "promotionid": voucher['promotionid'],
+        "voucher_code": voucher['code'],
+        "signature": voucher['signature'],
+        "need_basic_info": True,
+        "need_user_voucher_status": True,
+        "source": "0", 
+        "addition": []
+    }
+
+    try:
+        response = requests.post(url, headers=headers, json=payload, timeout=10)
+        data = response.json()
+        
+        if data.get('error') == 0:
+            info = data['data']['voucher_basic_info']
+            
+            # Build message
+            msg = f"🎫 <b>{info['voucher_code']}</b>\n"
+
+            # Discount info
+            if info.get('discount_percentage') and info.get('discount_percentage') > 0:
+                cap = info.get('coin_cap') or info.get('discount_cap') or 0
+                formatted_cap = format_currency_check(cap)
+                msg += f"💰 Giảm: {info['discount_percentage']}% (Tối đa {formatted_cap})\n"
+            elif info.get('discount_value'):
+                val = info['discount_value']
+                if val > 100000000: 
+                    val = val / 100000
+                msg += f"💰 Giảm: {format_currency_check(val)}\n"
+            else:
+                msg += "💰 Giảm: Freeship/Quà tặng\n"
+
+            # Min spend
+            min_spend = format_currency_check(info.get('min_spend', 0))
+            msg += f"🛒 Đơn tối thiểu: {min_spend}\n"
+
+            # Usage percentage
+            used = info['percentage_used']
+            if used >= 90:
+                msg += f"📊 Đã dùng: {used}% 🔴\n"
+            else:
+                msg += f"📊 Đã dùng: {used}% 🟢\n"
+
+            # Claimed percentage
+            claimed = info.get('percentage_claimed', 0)
+            if claimed >= 100:
+                msg += "📥 Lượt lưu: Đã hết lượt ⛔\n"
+            else:
+                msg += "📥 Lượt lưu: Còn lượt ✅\n"
+
+            # End time
+            end_time = datetime.fromtimestamp(info['end_time']).strftime('%H:%M:%S %d/%m/%Y')
+            msg += f"⏰ Hạn: {end_time}\n"
+            msg += "─" * 25
+
+            return (True, msg)
+        else:
+            err_code = data.get('error')
+            msg = f"❌ {voucher['code']}: Lỗi API ({err_code})"
+            return (False, msg)
+
+    except Exception as e:
+        msg = f"❌ {voucher['code']}: Lỗi kết nối ({str(e)[:30]})"
+        return (False, msg)
+
+
+def get_vouchers_from_stock():
+    """
+    Lấy danh sách voucher từ VoucherStock sheet
+    Trả về: list of dict {"code": str, "promotionid": int, "signature": str}
+    """
+    if not SHEET_READY or ws_voucher is None:
+        return []
+    
+    try:
+        rows = ws_voucher.get_all_records()
+    except Exception as e:
+        dprint(f"get_vouchers_from_stock error: {e}")
+        return []
+
+    voucher_list = []
+    for row in rows:
+        # Flexible column mapping
+        def _get(*keys):
+            for k in keys:
+                for rk in row:
+                    if str(rk).strip().lower() == k.lower():
+                        v = row[rk]
+                        return str(v).strip() if v is not None else ""
+            return ""
+
+        code = _get("code", "code_name", "voucher_code")
+        promo_id = _get("promotion_id", "promotionid")
+        sig = _get("signature", "chữ ký", "chu ky")
+
+        if code and promo_id:
+            try:
+                voucher_list.append({
+                    "code": code,
+                    "promotionid": int(promo_id),
+                    "signature": sig
+                })
+            except ValueError:
+                continue
+
+    return voucher_list
+
+
+def handle_check_voucher(user_id, username):
+    """
+    Xử lý khi user nhấn nút Check Voucher
+    """
+    # 1. Lấy cookie từ tab Cookie
+    cookie = get_cookie_from_sheet()
+
+    if not cookie:
+        tg_send(
+            user_id,
+            "❌ Không tìm thấy Cookie trong hệ thống!\n\n"
+            "Vui lòng liên hệ Admin để thêm Cookie vào tab Cookie.",
+            build_main_keyboard()
+        )
+        return
+
+    # 2. Lấy danh sách voucher từ VoucherStock
+    tg_send(user_id, "🔄 Đang tải danh sách voucher...")
+    vouchers = get_vouchers_from_stock()
+
+    if not vouchers:
+        tg_send(
+            user_id,
+            "❌ Không tìm thấy voucher nào trong VoucherStock!",
+            build_main_keyboard()
+        )
+        return
+
+    # 3. Check từng voucher
+    tg_send(user_id, f"📊 Tìm thấy {len(vouchers)} voucher. Bắt đầu check...\n")
+    
+    results = []
+    success_count = 0
+    fail_count = 0
+
+    for idx, voucher in enumerate(vouchers):
+        success, msg = check_one_voucher(voucher, cookie)
+        
+        if success:
+            success_count += 1
+        else:
+            fail_count += 1
+            
+        results.append(msg)
+
+        # Gửi từng kết quả (tránh message quá dài)
+        if (idx + 1) % 3 == 0 or idx == len(vouchers) - 1:
+            batch_msg = "\n\n".join(results[-3:])
+            tg_send(user_id, batch_msg)
+            time.sleep(0.5)  # Tránh spam
+
+    # 4. Tổng kết
+    summary = (
+        f"\n\n{'='*30}\n"
+        f"📊 <b>TỔNG KẾT</b>\n"
+        f"✅ Thành công: {success_count}\n"
+        f"❌ Thất bại: {fail_count}\n"
+        f"📦 Tổng: {len(vouchers)}\n"
+        f"{'='*30}"
+    )
+    tg_send(user_id, summary, build_main_keyboard())
+
+    # 5. Log
+    if SHEET_READY and ws_log:
+        try:
+            ws_log.append_row([
+                datetime.now(VIETNAM_TZ).strftime("%Y-%m-%d %H:%M:%S"),
+                str(user_id),
+                username,
+                "CHECK_VOUCHER",
+                "0",
+                f"Checked {len(vouchers)} vouchers: {success_count} OK, {fail_count} fail"
+            ])
+        except Exception as e:
+            dprint(f"Log error: {e}")
+
+
+def get_tool_pc_link():
+    """
+    Lấy link Tool PC từ cột 'toolpc' trong VoucherStock
+    Trả về link hoặc None nếu không tìm thấy
+    """
+    if not SHEET_READY or ws_voucher is None:
+        return None
+    
+    try:
+        rows = ws_voucher.get_all_records()
+        
+        # Tìm link trong cột 'toolpc'
+        for row in rows:
+            # Flexible column mapping
+            for key in row:
+                if str(key).strip().lower() == "toolpc":
+                    link = str(row[key]).strip()
+                    if link and (link.startswith("http://") or link.startswith("https://")):
+                        dprint(f"✅ Tìm thấy link Tool PC: {link}")
+                        return link
+        
+        dprint("⚠️ Không tìm thấy link Tool PC trong cột 'toolpc'")
+        return None
+        
+    except Exception as e:
+        dprint(f"get_tool_pc_link error: {e}")
+        return None
 
 # =========================================================
 # 🔥 QR LOGIN FUNCTIONS
@@ -1751,20 +2039,21 @@ def ensure_user_exists(user_id, username=""):
     ✅ V6 PG-PRIMARY:
     - PostgreSQL: tạo dòng wallet nếu chưa có (nguồn chính)
     - Google Sheet: mirror fire-and-forget (không block critical path)
+    - ✅ User mới sẽ có status='new' và balance=0, cần kích hoạt để nhận 5100đ
     """
     user_id = int(user_id)
 
     if PG_POOL is None:
         return
 
-    # 1) PG: INSERT mới hoặc update username nếu đã có
+    # 1) PG: INSERT mới với status='new', balance=0 hoặc update username nếu đã có
     pg_exec("""
         INSERT INTO wallet (tele_id, username, balance, status, notes, gift)
-        VALUES (%s, %s, %s, 'active', 'auto từ bot', '')
+        VALUES (%s, %s, 0, 'new', 'Chưa kích hoạt', '')
         ON CONFLICT (tele_id) DO UPDATE SET
             username = CASE WHEN %s <> '' THEN %s ELSE wallet.username END,
             updated_at = NOW()
-    """, (user_id, username or "", NEW_USER_BONUS, username or "", username or ""))
+    """, (user_id, username or "", username or "", username or ""))
 
     # 2) Sheet mirror (fire-and-forget) — chỉ để theo dõi
     if SHEET_READY:
@@ -1774,9 +2063,10 @@ def ensure_user_exists(user_id, username=""):
                 ws_money.append_row([
                     str(user_id),
                     username or "",
-                    NEW_USER_BONUS,
-                    "active",
-                    "auto từ bot",
+                    0,
+                    "new",
+                    "Chưa kích hoạt",
+                    "",
                     ""
                 ])
                 invalidate_user_row_cache(user_id)
@@ -2627,6 +2917,43 @@ def handle_callback_query(cb):
         handle_qr_cancel(chat_id, session_id)
         return
 
+    # ===== ACTIVATE GIFT CALLBACK =====
+    if data == "activate_gift":
+        tg_answer_callback(cb_id)
+        success, result = handle_active_gift_5k(user_id, username)
+        
+        if success:
+            # result là new_balance
+            new_balance = result
+            tg_send(
+                chat_id,
+                f"🎉 <b>KÍCH HOẠT THÀNH CÔNG!</b>\n\n"
+                f"💰 Bạn đã nhận <b>{ACTIVE_GIFT_AMOUNT:,}đ</b>\n"
+                f"💼 Số dư hiện tại: <b>{new_balance:,}đ</b>\n\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n"
+                f"🆕 <b>TÍNH NĂNG MỚI</b>\n\n"
+                f"🔑 <b>Get Cookie QR</b>\n"
+                f"├ Quét QR lấy Cookie Shopee\n"
+                f"├ Không cần nhập thủ công\n"
+                f"└ Cookie tự động lưu 7 ngày\n\n"
+                f"🖥️ <b>Tool ADD Voucher PC</b>\n"
+                f"├ Lưu voucher từ máy tính\n"
+                f"├ Nhanh gấp 10 lần bot Telegram\n"
+                f"├ Hỗ trợ nhiều tài khoản\n"
+                f"└ Bấm nút bên dưới để tải\n\n"
+                f"📊 <b>Check Voucher</b>\n"
+                f"├ Kiểm tra voucher còn hạn không\n"
+                f"├ Xem % đã dùng, lượt lưu\n"
+                f"└ Cập nhật real-time\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n\n"
+                f"🛒 <b>Bắt đầu mua voucher ngay!</b>",
+                build_main_keyboard(is_active=True)
+            )
+        else:
+            # result là error message
+            tg_send(chat_id, result, build_main_keyboard(is_active=True))
+        return
+
     # ===== QUICK SAVE VOUCHER CALLBACKS =====
     if data.startswith("QUICK_SAVE:"):
         voucher_key = data.split(":", 1)[1]
@@ -3317,42 +3644,59 @@ def handle_update(update):
         ensure_user_exists(user_id, username)
         exists, balance, status = get_user_data(user_id)
 
-        # ✅ Message cho user mới (đã AUTO active + 5100đ)
-        if is_new_user:
-            tg_send(
-                chat_id,
-                f"🎉 <b>CHÀO MỪNG BẠN MỚI!</b>\n\n"
-                f"👋 Xin chào <b>{username or 'bạn'}</b>\n\n"
-                f"🎁 Bạn nhận được <b>{NEW_USER_BONUS:,}đ</b> thưởng!\n"
-                f"💼 Số dư: <b>{balance:,}đ</b>\n"
-                f"📊 Trạng thái: <b>{status}</b>\n\n"
-                f"🛒 Bấm nút bên dưới để bắt đầu mua voucher",
-                build_main_keyboard(is_active=True)
-            )
+        # ✅ User chưa kích hoạt (status != 'active') → Hiển thị nút kích hoạt
+        if status != "active":
+            activate_button = {
+                "inline_keyboard": [[
+                    {"text": "🎁 Kích hoạt nhận 5,100đ", "callback_data": "activate_gift"}
+                ]]
+            }
+            
+            if is_new_user:
+                # User mới
+                tg_send(
+                    chat_id,
+                    f"🎉 <b>CHÀO MỪNG BẠN MỚI!</b>\n\n"
+                    f"👋 Xin chào <b>{username or 'bạn'}</b>\n\n"
+                    f"💼 Số dư hiện tại: <b>{balance:,}đ</b>\n"
+                    f"📊 Trạng thái: <b>Chưa kích hoạt</b>\n\n"
+                    f"🎁 <b>Nhấn nút bên dưới để kích hoạt và nhận {NEW_USER_BONUS:,}đ!</b>",
+                    activate_button
+                )
+            else:
+                # User cũ chưa active
+                tg_send(
+                    chat_id,
+                    f"👋 <b>Chào mừng quay lại!</b>\n\n"
+                    f"💼 Số dư hiện tại: <b>{balance:,}đ</b>\n"
+                    f"📊 Trạng thái: <b>{status}</b>\n\n"
+                    f"🎁 <b>Nhấn nút bên dưới để kích hoạt và nhận {ACTIVE_GIFT_AMOUNT:,}đ!</b>",
+                    activate_button
+                )
             return
 
-        # ✅ User cũ - Auto fix status nếu chưa active (PG)
-        if status != "active":
-            try:
-                pg_exec("UPDATE wallet SET status='active', updated_at=NOW() WHERE tele_id=%s", (int(user_id),))
-                # Mirror Sheet (fire-and-forget)
-                if SHEET_READY:
-                    try:
-                        row = get_user_row(user_id)
-                        if row:
-                            ws_money.update_cell(row, 4, "active")
-                    except Exception:
-                        pass
-                dprint(f"✅ Auto fixed status for user {user_id}: {status} → active")
-                status = "active"
-            except Exception as e:
-                dprint(f"❌ Failed to update status: {e}")
-
-        # ✅ User cũ - Luôn hiển thị "Chào mừng quay lại"
+        # ✅ User đã active - Không hiển thị nút kích hoạt
         tg_send(
             chat_id,
             f"👋 <b>Chào mừng quay lại!</b>\n\n"
-            f"💼 Số dư: <b>{balance:,}đ</b>",
+            f"💼 Số dư: <b>{balance:,}đ</b>\n"
+            f"📊 Trạng thái: <b>Đã kích hoạt ✅</b>\n\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"🆕 <b>TÍNH NĂNG MỊN</b>\n\n"
+            f"🔑 <b>Get Cookie QR</b>\n"
+            f"├ Quét mã QR để lấy Cookie Shopee\n"
+            f"├ Không cần nhập thủ công\n"
+            f"└ Cookie tự động lưu 7 ngày\n\n"
+            f"🖥️ <b>Tool ADD Voucher PC</b>\n"
+            f"├ Lưu voucher từ máy tính\n"
+            f"├ Tốc độ nhanh hơn 10 lần\n"
+            f"├ Hỗ trợ nhiều tài khoản cùng lúc\n"
+            f"└ Tải ngay: Bấm nút bên dưới\n\n"
+            f"📊 <b>Check Voucher</b>\n"
+            f"├ Kiểm tra trạng thái voucher\n"
+            f"├ Xem % đã dùng, lượt lưu\n"
+            f"└ Cập nhật real-time\n"
+            f"━━━━━━━━━━━━━━━━━━━━",
             build_main_keyboard(is_active=True)
         )
         return
@@ -3444,6 +3788,14 @@ def handle_update(update):
             except Exception:
                 pass
 
+        # ✅ LẤY LINK TOOL ĐỘNG TỪ VOUCHERSTOCK
+        tool_link = get_tool_pc_link()
+        
+        if not tool_link:
+            # Fallback link mặc định nếu không tìm thấy
+            tool_link = "https://t.me/botxshopee/2580"
+            dprint("⚠️ Dùng link Tool PC mặc định (không tìm thấy trong sheet)")
+
         tg_send(
             chat_id,
             f"🖥️ <b>TOOL ADD VOUCHER PC</b>\n\n"
@@ -3451,7 +3803,7 @@ def handle_update(update):
             f"🔐 <b>Password:</b> <code>{new_pass}</code>\n\n"
             f"━━━━━━━━━━━━━━━━━━\n\n"
             f"📥 <b>TẢI TOOL:</b>\n"
-            f"🔗 <a href='https://t.me/botxshopee/2580'>Tải ToolADDPC.exe (56.4 MB)</a>\n\n"
+            f"🔗 <a href='{tool_link}'>Tải ToolADDPC.exe</a>\n\n"
             f"━━━━━━━━━━━━━━━━━━\n\n"
             f"📖 <b>HƯỚNG DẪN SỬ DỤNG:</b>\n"
             f"1️⃣ Bấm link bên trên để tải file\n"
@@ -3510,6 +3862,11 @@ def handle_update(update):
             build_voucher_info_text(),
             build_quick_voucher_keyboard()
         )
+        return
+
+    # ===== CHECK VOUCHER =====
+    if text in ("📊 Check Voucher", "📊 Check voucher", "/checkvoucher"):
+        handle_check_voucher(user_id, username)
         return
 
     # ===== CHẶN LƯU NẾU CHƯA ACTIVE =====
