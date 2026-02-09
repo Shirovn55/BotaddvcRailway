@@ -728,10 +728,6 @@ def check_one_voucher(voucher, cookie):
             else:
                 msg += "💰 Giảm: Freeship/Quà tặng\n"
 
-            # Min spend
-            min_spend = format_currency_check(info.get('min_spend', 0))
-            msg += f"🛒 Đơn tối thiểu: {min_spend}\n"
-
             # Usage percentage
             used = info['percentage_used']
             if used >= 90:
@@ -749,13 +745,13 @@ def check_one_voucher(voucher, cookie):
             # End time
             end_time = datetime.fromtimestamp(info['end_time']).strftime('%H:%M:%S %d/%m/%Y')
             msg += f"⏰ Hạn: {end_time}\n"
-            msg += "─" * 30  # ✅ THÊM DẤU NGĂN CÁCH
+            msg += "─" * 20  # ✅ RÚT NGẮN TỪ 30 XUỐNG 20
 
             return (True, msg)
         else:
             err_code = data.get('error')
             display_name = voucher.get('display_name', voucher['code'])
-            msg = f"❌ {display_name}: Lỗi API ({err_code})\n" + "─" * 30
+            msg = f"❌ {display_name}: Lỗi API ({err_code})\n" + "─" * 20
             return (False, msg)
 
     except Exception as e:
