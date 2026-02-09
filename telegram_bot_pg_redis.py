@@ -735,14 +735,18 @@ def check_one_voucher(voucher, cookie):
             else:
                 msg += f"📊 Đã dùng: {used}% 🟢\n"
 
-            # Check lượt lưu bằng left_count (chính xác)
-            left_count = info.get('left_count', -1)
+            # Check lượt lưu bằng left_count (chính xác + an toàn)
+            left_count_raw = info.get('left_count', -1)
+            try:
+                left_count = int(left_count_raw) if left_count_raw is not None else -1
+            except (ValueError, TypeError):
+                left_count = -1
+            
             if left_count == 0:
                 msg += "📥 Lượt lưu: Đã hết lượt ⛔\n"
             elif left_count > 0:
                 msg += f"📥 Lượt lưu: Còn {left_count} lượt ✅\n"
             else:
-                # left_count = -1 hoặc None → Không giới hạn
                 msg += "📥 Lượt lưu: Không giới hạn ✅\n"
 
             # End time
