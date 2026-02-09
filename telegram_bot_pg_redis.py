@@ -622,10 +622,9 @@ def build_main_keyboard(is_active=True):
     return {
         "keyboard": [
             ["💎 Nạp tiền", "💰 Số dư"],
-            ["🎁 Lưu Voucher", "📊 Check Voucher"],  # ✅ THÊM NÚT CHECK VOUCHER
-            ["🔑 Get Cookie QR"],
-            ["🖥️ Tải & Lấy Pass Tool ADD PC"],
-            ["🧩 Hệ Thống Bot"]
+            ["🎁 Lưu Voucher", "📊 Check Voucher"],
+            ["🔑 Get Cookie QR", "🧩 Hệ Thống Bot"],  # ✅ GỘP VÀO 1 HÀNG
+            ["🖥️ Tải & Lấy Pass Tool ADD PC"]
         ],
         "resize_keyboard": True
     }
@@ -749,18 +748,19 @@ def check_one_voucher(voucher, cookie):
 
             # End time
             end_time = datetime.fromtimestamp(info['end_time']).strftime('%H:%M:%S %d/%m/%Y')
-            msg += f"⏰ Hạn: {end_time}"
+            msg += f"⏰ Hạn: {end_time}\n"
+            msg += "─" * 30  # ✅ THÊM DẤU NGĂN CÁCH
 
             return (True, msg)
         else:
             err_code = data.get('error')
             display_name = voucher.get('display_name', voucher['code'])
-            msg = f"❌ {display_name}: Lỗi API ({err_code})"
+            msg = f"❌ {display_name}: Lỗi API ({err_code})\n" + "─" * 30
             return (False, msg)
 
     except Exception as e:
         display_name = voucher.get('display_name', voucher['code'])
-        msg = f"❌ {display_name}: Lỗi kết nối ({str(e)[:30]})"
+        msg = f"❌ {display_name}: Lỗi kết nối ({str(e)[:30]})\n" + "─" * 30
         return (False, msg)
 
 
