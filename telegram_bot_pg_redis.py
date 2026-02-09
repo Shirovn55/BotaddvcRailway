@@ -747,7 +747,7 @@ def check_one_voucher(voucher, cookie):
             elif left_count > 0:
                 msg += f"📥 Lượt lưu: Còn {left_count} lượt ✅\n"
             else:
-                msg += "📥 Lượt lưu: Không giới hạn ✅\n"
+                msg += "📥 Lượt lưu: Còn lượt ✅\n"
 
             # End time
             end_time = datetime.fromtimestamp(info['end_time']).strftime('%H:%M:%S %d/%m/%Y')
