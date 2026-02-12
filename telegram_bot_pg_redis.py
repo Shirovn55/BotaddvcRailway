@@ -272,7 +272,7 @@ BAN_DURATION_1H = 3600
 # =========================================================
 # DEBUG FLAG
 # =========================================================
-DEBUG = True
+DEBUG = os.getenv("DEBUG", "0").strip() in ("1", "true", "True")
 
 def dprint(*args):
     if DEBUG:
