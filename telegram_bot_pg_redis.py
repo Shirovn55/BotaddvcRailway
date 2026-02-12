@@ -422,7 +422,7 @@ def cache_user_row(user_id, row_number):
     """Cache row number của user"""
     USER_ROW_CACHE[user_id] = row_number
     USER_ROW_CACHE_TIME[user_id] = time.time()
-    dprint(f"✅ Cached row for user {user_id}: row {row_number}")
+#    dprint(f"✅ Cached row for user {user_id}: row {row_number}")
 
 def get_cached_user_row(user_id):
     """Get row number từ cache. Returns: row_number hoặc None"""
