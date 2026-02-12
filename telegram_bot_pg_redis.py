@@ -4380,7 +4380,8 @@ def webhook_sepay():
 @app.route("/webhook", methods=["POST"])
 def webhook():
     update = request.get_json(force=True)
-    handle_update(update)
+    t = threading.Thread(target=handle_update, args=(update,), daemon=True)
+    t.start()
     return "ok"
 
 @app.route("/", methods=["GET"])
