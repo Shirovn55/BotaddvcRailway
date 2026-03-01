@@ -3618,6 +3618,58 @@ def handle_update(update):
         )
         return
 
+    # ===== ADMIN: /trutien <tele_id> <sotien> =====
+    if text and text.startswith("/trutien"):
+        if user_id != ADMIN_ID:
+            tg_send(chat_id, "⛔ Lệnh này chỉ dành cho Admin")
+            return
+
+        parts = text.split()
+        if len(parts) != 3:
+            tg_send(
+                chat_id,
+                "💡 Cú pháp: <code>/trutien TELE_ID SO_TIEN</code>\n"
+                "Ví dụ: <code>/trutien 123456789 50000</code>"
+            )
+            return
+
+        try:
+            target_user_id = int(parts[1])
+            amount = int(parts[2].replace(",", ""))
+        except Exception:
+            tg_send(chat_id, "❌ TELE_ID hoặc số tiền không hợp lệ.")
+            return
+
+        if target_user_id <= 0 or amount <= 0:
+            tg_send(chat_id, "❌ TELE_ID và số tiền phải lớn hơn 0.")
+            return
+
+        ensure_user_exists(target_user_id, "")
+        success, new_balance = deduct_balance_atomic(target_user_id, amount)
+        if not success:
+            tg_send(
+                chat_id,
+                f"❌ Trừ tiền thất bại (không đủ số dư)\n"
+                f"💼 Số dư hiện tại: <b>{new_balance:,}đ</b>"
+            )
+            return
+
+        log_row(target_user_id, "", "ADMIN_DEDUCT", f"-{amount}", f"admin={user_id}")
+
+        tg_send(
+            chat_id,
+            f"✅ Đã trừ <b>{amount:,}đ</b> của <code>{target_user_id}</code>\n"
+            f"💼 Số dư mới: <b>{new_balance:,}đ</b>"
+        )
+
+        tg_send(
+            target_user_id,
+            f"💳 <b>Bạn vừa bị trừ tiền</b>\n"
+            f"➖ Số tiền: <b>{amount:,}đ</b>\n"
+            f"💼 Số dư hiện tại: <b>{new_balance:,}đ</b>"
+        )
+        return
+
     if not text:
         if user_id not in PENDING_VOUCHER:
             return
