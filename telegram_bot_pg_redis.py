@@ -2026,6 +2026,70 @@ def apply_ban(user_id, ban_type):
     except Exception as e:
         dprint("apply_ban error:", e)
 
+def clear_user_ban_trackers(user_id):
+    """Reset các tracker spam/QR liên quan đến ban của user."""
+    user_id = int(user_id)
+
+    # RAM trackers
+    SPAM_TRACKER.pop(user_id, None)
+    with qr_failures_lock:
+        qr_failures.pop(user_id, None)
+
+    # Redis trackers
+    if RDS is not None:
+        try:
+            keys = [
+                f"ban_count:{user_id}",
+                f"spam:SPAM_CALLBACK:{user_id}",
+                f"spam:SPAM_COMMAND:{user_id}",
+                f"spam:SPAM_TEXT:{user_id}",
+            ]
+            RDS.delete(*keys)
+        except Exception as e:
+            dprint(f"clear_user_ban_trackers redis error: {e}")
+
+def unban_user(user_id, admin_id=0):
+    """
+    Gỡ ban thủ công cho user:
+    - status -> active
+    - reset spam/QR trackers
+    - mirror sang Sheet (nếu có)
+    """
+    user_id = int(user_id)
+
+    if PG_POOL is None:
+        return False, "PG_UNAVAILABLE"
+
+    r = pg_exec("SELECT status FROM wallet WHERE tele_id=%s", (user_id,), fetchone=True)
+    if not r:
+        return False, "NOT_FOUND"
+
+    old_status = (r[0] or "").strip().lower()
+    if old_status not in ("banned", "ban_1h", "banned_qr_spam"):
+        clear_user_ban_trackers(user_id)
+        return False, old_status or "unknown"
+
+    note = f"UNBAN by admin {admin_id} at {now_datetime().strftime('%Y-%m-%d %H:%M:%S')}"
+    pg_exec(
+        "UPDATE wallet SET status='active', notes=%s, updated_at=NOW() WHERE tele_id=%s",
+        (note, user_id),
+    )
+
+    # mirror sheet (fire-and-forget)
+    if SHEET_READY:
+        try:
+            row = get_user_row(user_id)
+            if row:
+                ws_money.update_cell(row, 4, "active")
+                ws_money.update_cell(row, 6, note)
+        except Exception:
+            pass
+
+    clear_user_ban_trackers(user_id)
+    log_row(user_id, "", "ADMIN_UNBAN", "0", f"admin={admin_id} | from={old_status}")
+    dprint(f"✅ Unbanned user {user_id} (from {old_status}) by admin {admin_id}")
+    return True, old_status
+
 def get_user_row(user_id):
     """
     ✅ V4: Cache-first, giảm 80% Sheet API calls
@@ -3667,6 +3731,61 @@ def handle_update(update):
             f"💳 <b>Bạn vừa bị trừ tiền</b>\n"
             f"➖ Số tiền: <b>{amount:,}đ</b>\n"
             f"💼 Số dư hiện tại: <b>{new_balance:,}đ</b>"
+        )
+        return
+
+    # ===== ADMIN: /unban <tele_id> =====
+    if text and text.startswith("/unban"):
+        if user_id != ADMIN_ID:
+            tg_send(chat_id, "⛔ Lệnh này chỉ dành cho Admin")
+            return
+
+        parts = text.split()
+        if len(parts) != 2:
+            tg_send(
+                chat_id,
+                "💡 Cú pháp: <code>/unban TELE_ID</code>\n"
+                "Ví dụ: <code>/unban 7952164758</code>"
+            )
+            return
+
+        try:
+            target_user_id = int(parts[1])
+        except Exception:
+            tg_send(chat_id, "❌ TELE_ID không hợp lệ.")
+            return
+
+        if target_user_id <= 0:
+            tg_send(chat_id, "❌ TELE_ID phải lớn hơn 0.")
+            return
+
+        ok, info = unban_user(target_user_id, admin_id=user_id)
+        if not ok:
+            if info == "PG_UNAVAILABLE":
+                tg_send(chat_id, "❌ PostgreSQL chưa sẵn sàng, không thể unban lúc này.")
+            elif info == "NOT_FOUND":
+                tg_send(chat_id, f"❌ Không tìm thấy user <code>{target_user_id}</code> trong hệ thống.")
+            else:
+                tg_send(chat_id, f"ℹ️ User <code>{target_user_id}</code> không ở trạng thái bị ban (status: <b>{info}</b>).")
+            return
+
+        status_text = {
+            "banned": "Ban vĩnh viễn",
+            "ban_1h": "Ban 1 giờ",
+            "banned_qr_spam": "Ban QR spam",
+        }.get(info, info)
+
+        tg_send(
+            chat_id,
+            f"✅ Đã unban user <code>{target_user_id}</code>\n"
+            f"📌 Trạng thái trước đó: <b>{status_text}</b>\n"
+            "📊 Trạng thái mới: <b>active</b>"
+        )
+
+        tg_send(
+            target_user_id,
+            "✅ <b>Tài khoản của bạn đã được mở khóa bởi admin.</b>\n"
+            "Bạn có thể sử dụng bot lại bình thường."
         )
         return
 
