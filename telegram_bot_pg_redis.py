@@ -25,13 +25,14 @@ from flask import Flask, request
 # PG + REDIS (Wallet DB + Anti-spam)
 # =========================================================
 import psycopg2
-from psycopg2.pool import SimpleConnectionPool
+from psycopg2.pool import PoolError, ThreadedConnectionPool
 import redis
 from contextlib import contextmanager
 
 import urllib.parse
 import time
 import traceback
+from concurrent.futures import ThreadPoolExecutor
 from collections import deque  # ✅ Thêm deque cho PROCESSED_UPDATE_IDS
 
 # =========================================================
@@ -66,9 +67,36 @@ BOT_TOKEN  = os.getenv("TELEGRAM_TOKEN", "").strip()
 SHEET_ID   = os.getenv("GOOGLE_SHEET_ID", "").strip()
 CREDS_JSON = os.getenv("GOOGLE_SHEETS_CREDS_JSON", "").strip()
 ADMIN_ID   = int(os.getenv("ADMIN_TELEGRAM_ID", "0"))
+TELEGRAM_WEBHOOK_SECRET = os.getenv("TELEGRAM_WEBHOOK_SECRET", "").strip()
 
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 REDIS_URL    = os.getenv("REDIS_URL", "").strip()
+
+def _env_int(name, default):
+    try:
+        return int(str(os.getenv(name, str(default))).strip())
+    except Exception:
+        return int(default)
+
+def _env_float(name, default):
+    try:
+        return float(str(os.getenv(name, str(default))).strip())
+    except Exception:
+        return float(default)
+
+PG_POOL_MIN = max(1, _env_int("PG_POOL_MIN", 1))
+PG_POOL_MAX = max(PG_POOL_MIN, _env_int("PG_POOL_MAX", 20))
+PG_POOL_ACQUIRE_RETRIES = max(0, _env_int("PG_POOL_ACQUIRE_RETRIES", 40))
+PG_POOL_ACQUIRE_SLEEP = max(0.01, _env_float("PG_POOL_ACQUIRE_SLEEP", 0.05))
+TELEGRAM_UPDATE_WORKERS = max(1, _env_int("TELEGRAM_UPDATE_WORKERS", 12))
+
+# SEPAY
+SEPAY_WEBHOOK_SECRET = os.getenv("SEPAY_WEBHOOK_SECRET", "").strip()
+SEPAY_ACC_NO = os.getenv("SEPAY_ACC_NO", "101866911892").strip()
+SEPAY_BANK = os.getenv("SEPAY_BANK", "VietinBank").strip()
+SEPAY_QR_TEMPLATE = os.getenv("SEPAY_QR_TEMPLATE", "compact").strip()
+SEPAY_QR_DESC_PREFIX = os.getenv("SEPAY_QR_DESC_PREFIX", "SEVQR NAP").strip()
+SEPAY_QR_BASE = os.getenv("SEPAY_QR_BASE", "https://qr.sepay.vn").strip()
 
 # Mirror ví tiền ra Google Sheet để bạn theo dõi (không bắt buộc)
 SHEET_MIRROR_WALLET = os.getenv("SHEET_MIRROR_WALLET", "1").strip() in ("1","true","True","YES","yes")
@@ -76,6 +104,59 @@ SHEET_MIRROR_WALLET = os.getenv("SHEET_MIRROR_WALLET", "1").strip() in ("1","tru
 
 BASE_URL = f"https://api.telegram.org/bot{BOT_TOKEN}"
 SAVE_URL = "https://shopee.vn/api/v2/voucher_wallet/save_vouchers"
+
+def _normalize_public_url(raw_url: str) -> str:
+    raw_url = (raw_url or "").strip()
+    if not raw_url:
+        return ""
+    if not re.match(r"^https?://", raw_url, re.IGNORECASE):
+        raw_url = f"https://{raw_url}"
+    return raw_url.rstrip("/")
+
+def get_public_base_url() -> str:
+    candidates = [
+        os.getenv("WEBHOOK_URL", "").strip(),
+        os.getenv("APP_URL", "").strip(),
+        os.getenv("RAILWAY_STATIC_URL", "").strip(),
+        os.getenv("RAILWAY_PUBLIC_DOMAIN", "").strip(),
+    ]
+
+    for raw_url in candidates:
+        base_url = _normalize_public_url(raw_url)
+        if not base_url:
+            continue
+        if base_url.endswith("/webhook"):
+            return base_url[:-len("/webhook")]
+        return base_url
+    return ""
+
+def ensure_telegram_webhook():
+    if not BOT_TOKEN:
+        print("⚠️ TELEGRAM_TOKEN trống -> không thể set Telegram webhook.")
+        return
+
+    public_base_url = get_public_base_url()
+    if not public_base_url:
+        print("⚠️ Chưa có APP_URL / WEBHOOK_URL / RAILWAY_PUBLIC_DOMAIN -> bỏ qua set Telegram webhook.")
+        return
+
+    webhook_url = f"{public_base_url}/webhook"
+    payload = {
+        "url": webhook_url,
+        "allowed_updates": ["message", "callback_query"],
+    }
+    if TELEGRAM_WEBHOOK_SECRET:
+        payload["secret_token"] = TELEGRAM_WEBHOOK_SECRET
+
+    try:
+        resp = requests.post(f"{BASE_URL}/setWebhook", json=payload, timeout=20)
+        data = resp.json()
+        if resp.ok and data.get("ok"):
+            print(f"✅ Telegram webhook active: {webhook_url}")
+        else:
+            print(f"⚠️ setWebhook failed: status={resp.status_code} body={data}")
+    except Exception as e:
+        print(f"⚠️ setWebhook error: {e}")
 
 # =========================================================
 # PG POOL + REDIS CLIENT
@@ -89,11 +170,12 @@ def _init_pg():
         print("⚠️ DATABASE_URL trống -> bot sẽ fallback dùng Google Sheet cho ví tiền (không khuyến nghị).")
         return
     if PG_POOL is None:
-        PG_POOL = SimpleConnectionPool(
-            minconn=1,
-            maxconn=5,
+        PG_POOL = ThreadedConnectionPool(
+            minconn=PG_POOL_MIN,
+            maxconn=PG_POOL_MAX,
             dsn=DATABASE_URL,
         )
+        print(f"✅ PostgreSQL pool initialized (thread-safe): min={PG_POOL_MIN}, max={PG_POOL_MAX}")
 
 @contextmanager
 def pg_conn():
@@ -101,12 +183,34 @@ def pg_conn():
     if PG_POOL is None:
         yield None
         return
-    conn = PG_POOL.getconn()
+    conn = None
+    last_err = None
+    for attempt in range(PG_POOL_ACQUIRE_RETRIES + 1):
+        try:
+            conn = PG_POOL.getconn()
+            break
+        except PoolError as e:
+            last_err = e
+            if attempt < PG_POOL_ACQUIRE_RETRIES:
+                time.sleep(PG_POOL_ACQUIRE_SLEEP)
+                continue
+        except Exception as e:
+            last_err = e
+        break
+
+    if conn is None:
+        dprint(
+            "PG pool exhausted/getconn failed "
+            f"(retries={PG_POOL_ACQUIRE_RETRIES}, sleep={PG_POOL_ACQUIRE_SLEEP}s): {last_err}"
+        )
+        yield None
+        return
+
     try:
         yield conn
     finally:
         try:
-            PG_POOL.putconn(conn)
+            PG_POOL.putconn(conn, close=bool(getattr(conn, "closed", 0)))
         except Exception:
             pass
 
@@ -139,6 +243,43 @@ def pg_exec(sql: str, params=None, fetchone=False, fetchall=False):
                 cur.close()
             except Exception:
                 pass
+
+def pg_exec_rowcount(sql: str, params=None):
+    if PG_POOL is None:
+        return 0
+    with pg_conn() as conn:
+        if conn is None:
+            return 0
+        conn.autocommit = False
+        cur = conn.cursor()
+        try:
+            cur.execute(sql, params or ())
+            rc = int(cur.rowcount or 0)
+            conn.commit()
+            return rc
+        except Exception as e:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            dprint(f"PG rowcount error: {e}")
+            return 0
+        finally:
+            try:
+                cur.close()
+            except Exception:
+                pass
+
+def mark_tx_processed(tx_id: str, tele_id: int, amount: int) -> bool:
+    if not tx_id:
+        return False
+    if PG_POOL is None:
+        return True
+    rc = pg_exec_rowcount(
+        "INSERT INTO processed_tx (tx_id, tele_id, amount) VALUES (%s, %s, %s) ON CONFLICT (tx_id) DO NOTHING",
+        (str(tx_id), int(tele_id), int(amount)),
+    )
+    return rc > 0
 
 def pg_init_tables():
     """Tạo bảng ví + bảng chống nạp trùng (tx_id)"""
@@ -251,12 +392,13 @@ def calc_topup_bonus(amount):
     return 0, 0
 
 def build_sepay_qr(user_id, amount=None):
-    base = "https://qr.sepay.vn/img"
+    base_root = (SEPAY_QR_BASE or "https://qr.sepay.vn").rstrip("/")
+    base = base_root + ("" if base_root.endswith("/img") else "/img")
     params = {
-        "acc": "101866911892",
-        "bank": "VietinBank",
-        "template": "compact",
-        "des": f"SEVQR NAP {user_id}"
+        "acc": SEPAY_ACC_NO or "101866911892",
+        "bank": SEPAY_BANK or "VietinBank",
+        "template": SEPAY_QR_TEMPLATE or "compact",
+        "des": f"{SEPAY_QR_DESC_PREFIX} {user_id}".strip()
     }
     if amount:
         params["amount"] = str(int(amount))
@@ -4511,13 +4653,28 @@ def webhook_sepay():
     if request.method == "GET":
         return "OK", 200
 
+    if SEPAY_WEBHOOK_SECRET:
+        recv_secret = (
+            request.headers.get("X-Sepay-Secret")
+            or request.headers.get("X-Webhook-Secret")
+            or ""
+        ).strip()
+        if recv_secret != SEPAY_WEBHOOK_SECRET:
+            return "UNAUTHORIZED", 401
+
     data = request.get_json(force=True, silent=True) or {}
+    if isinstance(data, list):
+        data = data[0] if data else {}
+    if not isinstance(data, dict):
+        data = {}
     if not data:
         return "EMPTY", 200
 
     tx_id = str(
         data.get("id")
         or data.get("transaction_id")
+        or data.get("gatewayTransactionId")
+        or data.get("transferCode")
         or data.get("tx_id")
         or data.get("referenceCode")
         or ""
@@ -4567,8 +4724,19 @@ def webhook_sepay():
 
     ensure_user_exists(user_id, "")
     
+    # ✅ Mark tx processed (PG) để chống trùng
+    if not mark_tx_processed(tx_id, user_id, total_add):
+        print("[SEPAY] DUPLICATE TX (PG):", tx_id)
+        return "DUPLICATE", 200
+
     # ✅ ATOMIC UPDATE - An toàn với concurrent webhooks
-    new_balance = update_balance_atomic(user_id, total_add)
+    ok_balance, new_balance = update_balance_atomic(user_id, total_add)
+    if not ok_balance:
+        # rollback processed_tx nếu update fail
+        if PG_POOL is not None:
+            pg_exec_rowcount("DELETE FROM processed_tx WHERE tx_id=%s", (str(tx_id),))
+        print("[SEPAY] UPDATE BALANCE FAILED:", tx_id)
+        return "ERROR", 500
 
     note = f"+{int(percent * 100)}%={bonus}" if bonus > 0 else ""
 
@@ -4603,11 +4771,30 @@ def webhook_sepay():
 # =========================================================
 # TELEGRAM WEBHOOK
 # =========================================================
+UPDATE_EXECUTOR = ThreadPoolExecutor(
+    max_workers=TELEGRAM_UPDATE_WORKERS,
+    thread_name_prefix="tg-update"
+)
+
+def _safe_handle_update(update):
+    try:
+        handle_update(update)
+    except Exception:
+        print("[handle_update] unhandled error:")
+        traceback.print_exc()
+
 @app.route("/webhook", methods=["POST"])
 def webhook():
-    update = request.get_json(force=True)
-    t = threading.Thread(target=handle_update, args=(update,), daemon=True)
-    t.start()
+    if TELEGRAM_WEBHOOK_SECRET:
+        recv_secret = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "").strip()
+        if recv_secret != TELEGRAM_WEBHOOK_SECRET:
+            return "Unauthorized", 401
+
+    update = request.get_json(force=True, silent=True) or {}
+    if not update:
+        return "bad request", 400
+
+    UPDATE_EXECUTOR.submit(_safe_handle_update, update)
     return "ok"
 
 @app.route("/", methods=["GET"])
@@ -4890,6 +5077,8 @@ def tool_log():
 # =========================================================
 # LOCAL RUNNER
 # =========================================================
+ensure_telegram_webhook()
+
 if __name__ == "__main__":
     print("=" * 60)
     print(" NgânMiu.Store Telegram Bot")
