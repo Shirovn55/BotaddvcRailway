@@ -15,6 +15,7 @@ NgânMiu.Store — Telegram Bot
 import os
 import json
 import re
+import hashlib
 import unicodedata
 import requests
 import random  # ✅ THÊM RANDOM CHO CHECK VOUCHER
@@ -84,11 +85,29 @@ def _env_float(name, default):
     except Exception:
         return float(default)
 
+# Không để webhook trần khi deploy production.
+# Nếu chưa set env, tự sinh secret ổn định theo BOT_TOKEN.
+if not TELEGRAM_WEBHOOK_SECRET and BOT_TOKEN:
+    TELEGRAM_WEBHOOK_SECRET = hashlib.sha256(
+        f"telegram-webhook:{BOT_TOKEN}".encode("utf-8")
+    ).hexdigest()[:48]
+    print("⚠️ TELEGRAM_WEBHOOK_SECRET chưa set -> dùng secret nội bộ tự sinh. Khuyến nghị set biến này trong Railway.")
+
 PG_POOL_MIN = max(1, _env_int("PG_POOL_MIN", 1))
 PG_POOL_MAX = max(PG_POOL_MIN, _env_int("PG_POOL_MAX", 20))
 PG_POOL_ACQUIRE_RETRIES = max(0, _env_int("PG_POOL_ACQUIRE_RETRIES", 40))
 PG_POOL_ACQUIRE_SLEEP = max(0.01, _env_float("PG_POOL_ACQUIRE_SLEEP", 0.05))
 TELEGRAM_UPDATE_WORKERS = max(1, _env_int("TELEGRAM_UPDATE_WORKERS", 12))
+
+# WEBHOOK / UPDATE RATE LIMIT
+WEBHOOK_IP_RATE_LIMIT = max(30, _env_int("WEBHOOK_IP_RATE_LIMIT", 240))
+WEBHOOK_IP_RATE_WINDOW = max(10, _env_int("WEBHOOK_IP_RATE_WINDOW", 60))
+USER_COMMAND_RATE_LIMIT = max(5, _env_int("USER_COMMAND_RATE_LIMIT", 8))
+USER_COMMAND_RATE_WINDOW = max(5, _env_int("USER_COMMAND_RATE_WINDOW", 20))
+USER_TEXT_RATE_LIMIT = max(8, _env_int("USER_TEXT_RATE_LIMIT", 15))
+USER_TEXT_RATE_WINDOW = max(5, _env_int("USER_TEXT_RATE_WINDOW", 20))
+USER_CALLBACK_RATE_LIMIT = max(6, _env_int("USER_CALLBACK_RATE_LIMIT", 12))
+USER_CALLBACK_RATE_WINDOW = max(5, _env_int("USER_CALLBACK_RATE_WINDOW", 10))
 
 # SEPAY
 SEPAY_WEBHOOK_SECRET = os.getenv("SEPAY_WEBHOOK_SECRET", "").strip()
@@ -552,6 +571,10 @@ CALLBACK_COOLDOWN_SECONDS = 2  # 2 giây giữa các click
 
 # ✅ SPAM TRACKER
 SPAM_TRACKER = {}
+
+# ✅ RATE LIMIT TRACKER (fallback RAM khi Redis lỗi)
+RATE_LIMIT_TRACKER = {}
+RATE_LIMIT_LOCK = threading.Lock()
 
 # =========================================================
 # 🔥 ROW NUMBER CACHE - GIẢM 80% SHEET API CALLS
@@ -1965,6 +1988,49 @@ def log_voucher_save(user_id, username, voucher_name, num_cookies, price, balanc
 # =========================================================
 # ✅ ANTI-SPAM SYSTEM
 # =========================================================
+def _rate_limit_exceeded(bucket, key, limit, window_sec):
+    """
+    Redis ưu tiên (scale đa instance), fallback RAM nếu Redis lỗi/mất kết nối.
+    Returns: (is_limited, current_count)
+    """
+    if limit <= 0:
+        return False, 0
+
+    skey = str(key or "unknown")
+    redis_key = f"rl:{bucket}:{skey}"
+
+    if RDS is not None:
+        try:
+            count = int(RDS.incr(redis_key))
+            if count == 1:
+                RDS.expire(redis_key, max(1, int(window_sec)))
+            return count > limit, count
+        except Exception as e:
+            dprint(f"rate limit redis fallback [{bucket}] -> {e}")
+
+    now = time.time()
+    local_key = f"{bucket}:{skey}"
+    with RATE_LIMIT_LOCK:
+        ticks = RATE_LIMIT_TRACKER.get(local_key)
+        if ticks is None:
+            ticks = deque()
+            RATE_LIMIT_TRACKER[local_key] = ticks
+
+        while ticks and (now - ticks[0] > window_sec):
+            ticks.popleft()
+
+        ticks.append(now)
+        return len(ticks) > limit, len(ticks)
+
+def _extract_client_ip():
+    xff = (request.headers.get("X-Forwarded-For", "") or "").split(",")[0].strip()
+    if xff:
+        return xff
+    real_ip = (request.headers.get("X-Real-IP", "") or "").strip()
+    if real_ip:
+        return real_ip
+    return (request.remote_addr or "unknown").strip() or "unknown"
+
 def track_error(user_id, username="", reason=""):
     """
     ✅ Anti-spam (Redis ưu tiên)
@@ -3137,6 +3203,22 @@ def handle_callback_query(cb):
     username = from_user.get("username", "")
     chat_id = cb.get("message", {}).get("chat", {}).get("id")
 
+    if user_id:
+        limited, count = _rate_limit_exceeded(
+            "user_callback",
+            user_id,
+            USER_CALLBACK_RATE_LIMIT,
+            USER_CALLBACK_RATE_WINDOW
+        )
+        if limited:
+            tg_answer_callback(cb_id, "🚫 Bấm nhanh quá, chậm lại chút nhé", True)
+            track_error(user_id, username, "SPAM_CALLBACK")
+            dprint(
+                f"🚫 Callback spam blocked: user={user_id} "
+                f"count={count}/{USER_CALLBACK_RATE_LIMIT} window={USER_CALLBACK_RATE_WINDOW}s"
+            )
+            return
+
     # ===== QR CALLBACKS =====
 
     if data.startswith("qr_cancel:"):
@@ -3346,6 +3428,7 @@ def handle_callback_query(cb):
         last_callback_time = CALLBACK_COOLDOWN.get(user_id, 0)
         if time.time() - last_callback_time < CALLBACK_COOLDOWN_SECONDS:
             tg_answer_callback(cb_id, "⏳ Chậm lại 1 chút", True)
+            track_error(user_id, username, "SPAM_CALLBACK")
             dprint(f"⏳ Callback rate-limited: user {user_id}")
             return
         
@@ -3740,6 +3823,35 @@ def handle_update(update):
     user_id = msg["from"]["id"]
     username = msg["from"].get("username", "")
     text = (msg.get("text") or "").strip()
+
+    if text.startswith("/"):
+        limited, count = _rate_limit_exceeded(
+            "user_command",
+            user_id,
+            USER_COMMAND_RATE_LIMIT,
+            USER_COMMAND_RATE_WINDOW
+        )
+        if limited:
+            track_error(user_id, username, "SPAM_COMMAND")
+            dprint(
+                f"🚫 Command spam blocked: user={user_id} "
+                f"count={count}/{USER_COMMAND_RATE_LIMIT} window={USER_COMMAND_RATE_WINDOW}s"
+            )
+            return
+    elif text:
+        limited, count = _rate_limit_exceeded(
+            "user_text",
+            user_id,
+            USER_TEXT_RATE_LIMIT,
+            USER_TEXT_RATE_WINDOW
+        )
+        if limited:
+            track_error(user_id, username, "SPAM_TEXT")
+            dprint(
+                f"🚫 Text spam blocked: user={user_id} "
+                f"count={count}/{USER_TEXT_RATE_LIMIT} window={USER_TEXT_RATE_WINDOW}s"
+            )
+            return
 
     # /tongket
     if text == "/tongket":
@@ -4790,8 +4902,24 @@ def webhook():
         if recv_secret != TELEGRAM_WEBHOOK_SECRET:
             return "Unauthorized", 401
 
+    client_ip = _extract_client_ip()
+    limited, count = _rate_limit_exceeded(
+        "webhook_ip",
+        client_ip,
+        WEBHOOK_IP_RATE_LIMIT,
+        WEBHOOK_IP_RATE_WINDOW
+    )
+    if limited:
+        dprint(
+            f"🚫 Webhook IP limited: ip={client_ip} "
+            f"count={count}/{WEBHOOK_IP_RATE_LIMIT} window={WEBHOOK_IP_RATE_WINDOW}s"
+        )
+        return "too many requests", 429
+
     update = request.get_json(force=True, silent=True) or {}
     if not update:
+        return "bad request", 400
+    if "update_id" not in update:
         return "bad request", 400
 
     UPDATE_EXECUTOR.submit(_safe_handle_update, update)
