@@ -4930,7 +4930,7 @@ def home():
     pg_ok = PG_POOL is not None
     sheet_status = "Sheet OK" if SHEET_READY else "Sheet DOWN (non-critical)"
     pg_status = "PG OK" if pg_ok else "PG DOWN (CRITICAL)"
-    return f"Bot is running V6 | {pg_status} | {sheet_status}", 200 if pg_ok else 503
+    return f"Bot is running V6 | {pg_status} | {sheet_status}", 200
 
 # =========================================================
 # 🛠️ TOOL API — PC Tool đọc/ghi ví qua HTTP
