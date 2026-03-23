@@ -138,6 +138,9 @@ TELEGRAM_UPDATE_WORKERS = max(1, _env_int("TELEGRAM_UPDATE_WORKERS", 12))
 # WEBHOOK / UPDATE RATE LIMIT
 WEBHOOK_IP_RATE_LIMIT = max(30, _env_int("WEBHOOK_IP_RATE_LIMIT", 240))
 WEBHOOK_IP_RATE_WINDOW = max(10, _env_int("WEBHOOK_IP_RATE_WINDOW", 60))
+USER_UPDATE_RATE_LIMIT = max(1, _env_int("USER_UPDATE_RATE_LIMIT", 10))
+USER_UPDATE_RATE_WINDOW = max(10, _env_int("USER_UPDATE_RATE_WINDOW", 60))
+USER_UPDATE_BAN_TYPE = (os.getenv("USER_UPDATE_BAN_TYPE", "PERMANENT") or "PERMANENT").strip().upper()
 USER_COMMAND_RATE_LIMIT = max(5, _env_int("USER_COMMAND_RATE_LIMIT", 8))
 USER_COMMAND_RATE_WINDOW = max(5, _env_int("USER_COMMAND_RATE_WINDOW", 20))
 USER_TEXT_RATE_LIMIT = max(8, _env_int("USER_TEXT_RATE_LIMIT", 15))
@@ -155,6 +158,11 @@ WEBHOOK_INFLIGHT_LIMIT = max(
 WEBHOOK_IP_PERMABAN_ENABLED = _env_bool("WEBHOOK_IP_PERMABAN_ENABLED", True)
 WEBHOOK_IP_STRIKE_LIMIT = max(10, _env_int("WEBHOOK_IP_STRIKE_LIMIT", 40))
 WEBHOOK_IP_STRIKE_WINDOW = max(10, _env_int("WEBHOOK_IP_STRIKE_WINDOW", 120))
+WEBHOOK_SUSPICIOUS_LIMIT = max(1, _env_int("WEBHOOK_SUSPICIOUS_LIMIT", 5))
+WEBHOOK_SUSPICIOUS_WINDOW = max(60, _env_int("WEBHOOK_SUSPICIOUS_WINDOW", 600))
+WEBHOOK_SUSPICIOUS_USER_BAN_TYPE = (
+    os.getenv("WEBHOOK_SUSPICIOUS_USER_BAN_TYPE", "PERMANENT") or "PERMANENT"
+).strip().upper()
 TELEGRAM_WEBHOOK_ENFORCE_IP_ALLOWLIST = _env_bool("TELEGRAM_WEBHOOK_ENFORCE_IP_ALLOWLIST", True)
 TELEGRAM_WEBHOOK_IP_ALLOWLIST = _env_cidr_list(
     "TELEGRAM_WEBHOOK_IP_ALLOWLIST",
@@ -170,6 +178,9 @@ TELEGRAM_VI_ALLOWED_LANGS = tuple(
     for x in (os.getenv("TELEGRAM_VI_ALLOWED_LANGS", "vi") or "vi").split(",")
     if x.strip()
 ) or ("vi",)
+NON_VI_AUTO_BAN = _env_bool("NON_VI_AUTO_BAN", True)
+NON_VI_NOTICE_COOLDOWN = max(0, _env_int("NON_VI_NOTICE_COOLDOWN", 21600))
+BANNED_USER_NOTICE_COOLDOWN = max(0, _env_int("BANNED_USER_NOTICE_COOLDOWN", 3600))
 
 if not TELEGRAM_WEBHOOK_PATH_TOKEN:
     print("⚠️ TELEGRAM_WEBHOOK_PATH_TOKEN chưa set -> webhook sẽ bị chặn (fail-closed).")
@@ -184,6 +195,8 @@ print(
     f", inflight_limit={WEBHOOK_INFLIGHT_LIMIT}"
     f", ip_permaban={WEBHOOK_IP_PERMABAN_ENABLED}"
     f", ip_allowlist={TELEGRAM_WEBHOOK_ENFORCE_IP_ALLOWLIST}"
+    f", suspicious_limit={WEBHOOK_SUSPICIOUS_LIMIT}/{WEBHOOK_SUSPICIOUS_WINDOW}s"
+    f", suspicious_user_ban={WEBHOOK_SUSPICIOUS_USER_BAN_TYPE}"
 )
 if TELEGRAM_WEBHOOK_ENFORCE_IP_ALLOWLIST:
     print(
@@ -192,9 +205,14 @@ if TELEGRAM_WEBHOOK_ENFORCE_IP_ALLOWLIST:
     )
 print(
     "🛡️ User policy:"
+    f" update_limit={USER_UPDATE_RATE_LIMIT}/{USER_UPDATE_RATE_WINDOW}s"
+    f", update_ban={USER_UPDATE_BAN_TYPE}"
     f" spam_perm_first={SPAM_PERMANENT_ON_FIRST_HIT}"
     f", vi_only={TELEGRAM_VI_ONLY_ENFORCE}"
     f", vi_langs={','.join(TELEGRAM_VI_ALLOWED_LANGS)}"
+    f", non_vi_autoban={NON_VI_AUTO_BAN}"
+    f", non_vi_notice_cd={NON_VI_NOTICE_COOLDOWN}s"
+    f", banned_notice_cd={BANNED_USER_NOTICE_COOLDOWN}s"
     f", admin_private={ADMIN_COMMAND_REQUIRE_PRIVATE_CHAT}"
 )
 if BOT_SELF_ID:
@@ -698,6 +716,8 @@ SPAM_TRACKER = {}
 # ✅ RATE LIMIT TRACKER (fallback RAM khi Redis lỗi)
 RATE_LIMIT_TRACKER = {}
 RATE_LIMIT_LOCK = threading.Lock()
+NOTICE_COOLDOWN_TRACKER = {}
+NOTICE_COOLDOWN_LOCK = threading.Lock()
 WEBHOOK_IP_BAN_LOCAL = set()
 WEBHOOK_IP_BAN_LOCK = threading.Lock()
 
@@ -2120,6 +2140,33 @@ def _rate_limit_exceeded(bucket, key, limit, window_sec):
         ticks.append(now)
         return len(ticks) > limit, len(ticks)
 
+def _cooldown_allows(bucket, key, cooldown_sec):
+    if cooldown_sec <= 0:
+        return True
+
+    skey = str(key or "unknown")
+    redis_key = f"cooldown:{bucket}:{skey}"
+
+    if RDS is not None:
+        try:
+            return bool(RDS.set(redis_key, "1", nx=True, ex=max(1, int(cooldown_sec))))
+        except Exception as e:
+            dprint(f"cooldown redis fallback [{bucket}] -> {e}")
+
+    now = time.time()
+    local_key = f"{bucket}:{skey}"
+    with NOTICE_COOLDOWN_LOCK:
+        expires_at = float(NOTICE_COOLDOWN_TRACKER.get(local_key, 0) or 0)
+        if expires_at > now:
+            return False
+
+        NOTICE_COOLDOWN_TRACKER[local_key] = now + cooldown_sec
+        if len(NOTICE_COOLDOWN_TRACKER) > 5000:
+            for stale_key, stale_until in list(NOTICE_COOLDOWN_TRACKER.items())[:500]:
+                if float(stale_until or 0) <= now:
+                    NOTICE_COOLDOWN_TRACKER.pop(stale_key, None)
+        return True
+
 def _to_valid_ip(ip_text: str) -> str:
     raw = (ip_text or "").strip()
     if not raw:
@@ -2213,6 +2260,235 @@ def _is_vi_language_code(lang_code: str) -> bool:
     for allowed in TELEGRAM_VI_ALLOWED_LANGS:
         if lc == allowed or lc.startswith(f"{allowed}-"):
             return True
+    return False
+
+def _send_banned_user_notice(chat_id, user_id, ban_type, ban_until):
+    if not chat_id:
+        return
+    if not _cooldown_allows("banned_user_notice", user_id, BANNED_USER_NOTICE_COOLDOWN):
+        dprint(f"ban notice cooldown hit: user={user_id}")
+        return
+
+    msg_text = (
+        "⛔ <b>TÀI KHOẢN BỊ KHÓA</b>\n\n"
+        "🚫 <b>Lý do:</b> Spam hệ thống\n"
+    )
+
+    if ban_type == "PERMANENT":
+        msg_text += "⏰ <b>Thời gian:</b> Vĩnh viễn\n\n"
+    else:
+        msg_text += (
+            f"⏰ <b>Thời gian:</b> 1 giờ\n"
+            f"⏱️ <b>Hết hạn:</b> {ban_until}\n\n"
+        )
+
+    msg_text += "📞 <b>Liên hệ:</b> @BonBonxHPx"
+    tg_send(chat_id, msg_text)
+
+def _notify_admin_suspicious_webhook(ip, update_kind, count):
+    if not ADMIN_ID or ADMIN_ID == 0:
+        return
+
+    ip = (ip or "").strip() or "unknown"
+    update_kind = str(update_kind or "unknown").strip() or "unknown"
+    cooldown_key = f"{ip}:{update_kind}"
+    if not _cooldown_allows("suspicious_webhook_alert", cooldown_key, WEBHOOK_SUSPICIOUS_WINDOW):
+        return
+
+    try:
+        msg = (
+            "⚠️ <b>WEBHOOK NGHI NGỜ</b>\n\n"
+            f"🌐 IP Telegram: <code>{ip}</code>\n"
+            f"🧩 Update kind: <b>{update_kind}</b>\n"
+            f"⚠️ Số lần: <b>{count}/{WEBHOOK_SUSPICIOUS_LIMIT}</b> trong "
+            f"<b>{WEBHOOK_SUSPICIOUS_WINDOW} giây</b>\n\n"
+            "ℹ️ Không auto-ban IP vì Telegram dùng IP chung.\n"
+            "Chỉ log và cảnh báo admin."
+        )
+        tg_send(ADMIN_ID, msg)
+    except Exception as e:
+        dprint(f"notify suspicious webhook error: {e}")
+
+def _handle_non_vi_user(user_id, username, chat_id, lang_code):
+    normalized_lang = str(lang_code or "").strip().lower() or "unknown"
+
+    if NON_VI_AUTO_BAN:
+        apply_ban(
+            user_id,
+            "PERMANENT",
+            note_override=f"Ban vĩnh viễn: Non-VI language ({normalized_lang})"
+        )
+
+    if chat_id and _cooldown_allows("non_vi_notice", user_id, NON_VI_NOTICE_COOLDOWN):
+        tg_send(chat_id, "⛔ Bot chỉ hỗ trợ người dùng Việt Nam.")
+
+    dprint(
+        f"policy block non-vi user={user_id} username={username} "
+        f"lang={normalized_lang} auto_ban={NON_VI_AUTO_BAN}"
+    )
+
+def _normalize_ban_type(raw_ban_type):
+    normalized = str(raw_ban_type or "PERMANENT").strip().upper()
+    if normalized not in ("PERMANENT", "1H"):
+        return "PERMANENT"
+    return normalized
+
+def _handle_global_user_flood(user_id, username, count):
+    ban_type = _normalize_ban_type(USER_UPDATE_BAN_TYPE)
+    note = (
+        f"Ban {ban_type}: user_update flood "
+        f"({count}/{USER_UPDATE_RATE_LIMIT} trong {USER_UPDATE_RATE_WINDOW}s)"
+    )
+    apply_ban(user_id, ban_type, note_override=note)
+    notify_admin_spam(user_id, username, ban_type, count)
+    dprint(
+        f"🚫 User flood autoban: user={user_id} username={username} "
+        f"count={count}/{USER_UPDATE_RATE_LIMIT} window={USER_UPDATE_RATE_WINDOW}s "
+        f"ban_type={ban_type}"
+    )
+
+def _detect_update_kind(update):
+    if not isinstance(update, dict):
+        return "unknown"
+
+    known_keys = (
+        "callback_query",
+        "message",
+        "edited_message",
+        "channel_post",
+        "edited_channel_post",
+        "inline_query",
+        "chosen_inline_result",
+        "shipping_query",
+        "pre_checkout_query",
+        "poll",
+        "poll_answer",
+        "my_chat_member",
+        "chat_member",
+        "chat_join_request",
+        "message_reaction",
+        "message_reaction_count",
+        "business_message",
+        "edited_business_message",
+        "deleted_business_messages",
+        "business_connection",
+        "purchased_paid_media",
+    )
+    for key in known_keys:
+        if update.get(key) is not None:
+            return key
+
+    for key, value in update.items():
+        if key != "update_id" and value is not None:
+            return str(key)
+    return "unknown"
+
+def _extract_update_actor(update):
+    update_kind = _detect_update_kind(update)
+    if not isinstance(update, dict):
+        return 0, "", 0, update_kind
+
+    callback_query = update.get("callback_query") or {}
+    if isinstance(callback_query, dict):
+        from_user = callback_query.get("from") or {}
+        chat_id = ((callback_query.get("message") or {}).get("chat") or {}).get("id")
+        actor_id = from_user.get("id")
+        if actor_id:
+            return actor_id, from_user.get("username", ""), chat_id, "callback_query"
+
+    message_keys = (
+        "message",
+        "edited_message",
+        "channel_post",
+        "edited_channel_post",
+        "business_message",
+        "edited_business_message",
+    )
+    for key in message_keys:
+        msg = update.get(key) or {}
+        if not isinstance(msg, dict):
+            continue
+        from_user = msg.get("from") or {}
+        chat_id = (msg.get("chat") or {}).get("id")
+        actor_id = from_user.get("id")
+        if actor_id:
+            return actor_id, from_user.get("username", ""), chat_id, key
+
+    actor_keys = (
+        "inline_query",
+        "chosen_inline_result",
+        "shipping_query",
+        "pre_checkout_query",
+        "poll_answer",
+        "my_chat_member",
+        "chat_member",
+        "chat_join_request",
+        "message_reaction",
+    )
+    for key in actor_keys:
+        obj = update.get(key) or {}
+        if not isinstance(obj, dict):
+            continue
+        from_user = obj.get("from") or obj.get("user") or {}
+        actor_id = from_user.get("id")
+        if actor_id:
+            chat_id = (obj.get("chat") or {}).get("id")
+            return actor_id, from_user.get("username", ""), chat_id, key
+
+    return 0, "", 0, update_kind
+
+def _record_suspicious_webhook_event(client_ip, user_id, username, update_kind):
+    update_kind = str(update_kind or "unknown").strip() or "unknown"
+
+    if user_id:
+        if _is_admin_user(user_id) or (BOT_SELF_ID and int(user_id) == int(BOT_SELF_ID)):
+            return False
+        limited, count = _rate_limit_exceeded(
+            "webhook_suspicious_user",
+            user_id,
+            WEBHOOK_SUSPICIOUS_LIMIT,
+            WEBHOOK_SUSPICIOUS_WINDOW
+        )
+        dprint(
+            f"⚠️ Suspicious webhook user={user_id} kind={update_kind} "
+            f"count={count}/{WEBHOOK_SUSPICIOUS_LIMIT} window={WEBHOOK_SUSPICIOUS_WINDOW}s"
+        )
+        if limited:
+            ban_type = _normalize_ban_type(WEBHOOK_SUSPICIOUS_USER_BAN_TYPE)
+            note = (
+                f"Ban {ban_type}: webhook suspicious noop "
+                f"({update_kind}) {count}/{WEBHOOK_SUSPICIOUS_LIMIT} trong "
+                f"{WEBHOOK_SUSPICIOUS_WINDOW}s"
+            )
+            apply_ban(user_id, ban_type, note_override=note)
+            notify_admin_spam(
+                user_id,
+                username,
+                ban_type,
+                count,
+                reason_label=f"Webhook nghi ngờ: {update_kind}",
+                window_sec=WEBHOOK_SUSPICIOUS_WINDOW
+            )
+            return True
+        return False
+
+    ip = (client_ip or "").strip()
+    if not ip or ip == "unknown":
+        return False
+
+    limited, count = _rate_limit_exceeded(
+        "webhook_suspicious_ip",
+        ip,
+        WEBHOOK_SUSPICIOUS_LIMIT,
+        WEBHOOK_SUSPICIOUS_WINDOW
+    )
+    dprint(
+        f"⚠️ Suspicious webhook ip={ip} kind={update_kind} "
+        f"count={count}/{WEBHOOK_SUSPICIOUS_LIMIT} window={WEBHOOK_SUSPICIOUS_WINDOW}s"
+    )
+    if limited:
+        _notify_admin_suspicious_webhook(ip, update_kind, count)
+        return False
     return False
 
 def _is_webhook_ip_banned(ip: str) -> bool:
@@ -2449,7 +2725,7 @@ def check_ban_status(user_id):
         dprint("check_ban_status error:", e)
         return {"banned": False}
 
-def notify_admin_spam(user_id, username, ban_type, error_count):
+def notify_admin_spam(user_id, username, ban_type, error_count, reason_label="Spam hệ thống", window_sec=60):
     if not ADMIN_ID or ADMIN_ID == 0:
         return
 
@@ -2473,7 +2749,8 @@ def notify_admin_spam(user_id, username, ban_type, error_count):
             "🚨 <b>CẢNH BÁO SPAM</b>\n\n"
             f"👤 User: {user_info}\n"
             f"📱 Tele ID: <code>{user_id}</code>\n"
-            f"⚠️ Số lỗi: <b>{error_count} lỗi trong 60 giây</b>\n\n"
+            f"📌 Lý do: <b>{reason_label}</b>\n"
+            f"⚠️ Số lỗi: <b>{error_count} lỗi trong {int(window_sec)} giây</b>\n\n"
             f"{ban_text}\n"
             f"{time_text}\n\n"
             "━━━━━━━━━━━━━━━\n"
@@ -2538,6 +2815,21 @@ def clear_user_ban_trackers(user_id):
 
     # RAM trackers
     SPAM_TRACKER.pop(user_id, None)
+    with RATE_LIMIT_LOCK:
+        for local_key in (
+            f"user_update:{user_id}",
+            f"webhook_suspicious_user:{user_id}",
+            f"user_command:{user_id}",
+            f"user_text:{user_id}",
+            f"user_callback:{user_id}",
+        ):
+            RATE_LIMIT_TRACKER.pop(local_key, None)
+    with NOTICE_COOLDOWN_LOCK:
+        for local_key in (
+            f"banned_user_notice:{user_id}",
+            f"non_vi_notice:{user_id}",
+        ):
+            NOTICE_COOLDOWN_TRACKER.pop(local_key, None)
     with qr_failures_lock:
         qr_failures.pop(user_id, None)
 
@@ -2546,9 +2838,16 @@ def clear_user_ban_trackers(user_id):
         try:
             keys = [
                 f"ban_count:{user_id}",
+                f"rl:user_update:{user_id}",
+                f"rl:webhook_suspicious_user:{user_id}",
+                f"rl:user_command:{user_id}",
+                f"rl:user_text:{user_id}",
+                f"rl:user_callback:{user_id}",
                 f"spam:SPAM_CALLBACK:{user_id}",
                 f"spam:SPAM_COMMAND:{user_id}",
                 f"spam:SPAM_TEXT:{user_id}",
+                f"cooldown:banned_user_notice:{user_id}",
+                f"cooldown:non_vi_notice:{user_id}",
             ]
             RDS.delete(*keys)
         except Exception as e:
@@ -4079,6 +4378,8 @@ def handle_update(update):
     msg = update.get("message") or callback_query.get("message", {})
     from_user = callback_query.get("from") or msg.get("from") or {}
     user_id = from_user.get("id")
+    username = from_user.get("username", "")
+    policy_chat_id = msg.get("chat", {}).get("id")
 
     if not user_id:
         return
@@ -4088,46 +4389,36 @@ def handle_update(update):
         # Không áp policy/anti-spam cho bot account.
         return
 
+    ban_status = check_ban_status(user_id)
+
+    if ban_status["banned"]:
+        _send_banned_user_notice(
+            policy_chat_id,
+            user_id,
+            ban_status["type"],
+            ban_status["until"]
+        )
+        return
+
     if TELEGRAM_VI_ONLY_ENFORCE and not _is_admin_user(user_id):
         lang_code = str(from_user.get("language_code", "") or "").strip().lower()
         if not lang_code:
             # language_code thiếu/unknown -> không auto-ban để tránh false-positive.
             dprint(f"vi-only skip unknown language: user={user_id}")
         elif not _is_vi_language_code(lang_code):
-            policy_chat_id = msg.get("chat", {}).get("id")
-            if policy_chat_id:
-                tg_send(
-                    policy_chat_id,
-                    "⛔ Bot chỉ hỗ trợ người dùng Việt Nam."
-                )
+            _handle_non_vi_user(user_id, username, policy_chat_id, lang_code)
             return
 
-    ban_status = check_ban_status(user_id)
-
-    if ban_status["banned"]:
-        ban_type = ban_status["type"]
-        ban_until = ban_status["until"]
-
-        msg_text = (
-            "⛔ <b>TÀI KHOẢN BỊ KHÓA</b>\n\n"
-            "🚫 <b>Lý do:</b> Spam hệ thống\n"
+    if not _is_admin_user(user_id):
+        limited, count = _rate_limit_exceeded(
+            "user_update",
+            user_id,
+            USER_UPDATE_RATE_LIMIT,
+            USER_UPDATE_RATE_WINDOW
         )
-
-        if ban_type == "PERMANENT":
-            msg_text += "⏰ <b>Thời gian:</b> Vĩnh viễn\n\n"
-        else:
-            msg_text += (
-                f"⏰ <b>Thời gian:</b> 1 giờ\n"
-                f"⏱️ <b>Hết hạn:</b> {ban_until}\n\n"
-            )
-
-        msg_text += "📞 <b>Liên hệ:</b> @BonBonxHPx"
-
-        ban_chat_id = msg.get("chat", {}).get("id")
-        if ban_chat_id:
-            tg_send(ban_chat_id, msg_text)
-
-        return
+        if limited:
+            _handle_global_user_flood(user_id, username, count)
+            return
 
     # ===== CALLBACK QUERY =====
     if "callback_query" in update:
@@ -5206,9 +5497,25 @@ def webhook(path_token=""):
 
     update = request.get_json(force=True, silent=True) or {}
     if not update:
+        _record_suspicious_webhook_event(client_ip, 0, "", "empty_update")
         return "bad request", 400
     if "update_id" not in update:
+        _record_suspicious_webhook_event(client_ip, 0, "", "missing_update_id")
         return "bad request", 400
+
+    actor_user_id, actor_username, _actor_chat_id, update_kind = _extract_update_actor(update)
+    if update_kind not in ("message", "callback_query"):
+        banned = _record_suspicious_webhook_event(
+            client_ip,
+            actor_user_id,
+            actor_username,
+            update_kind
+        )
+        dprint(
+            f"⚠️ Ignored suspicious webhook kind={update_kind} "
+            f"user={actor_user_id or 'unknown'} ip={client_ip} banned={banned}"
+        )
+        return "ok", 200
 
     if not WEBHOOK_INFLIGHT_SEM.acquire(blocking=False):
         dprint(
