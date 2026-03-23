@@ -125,13 +125,9 @@ def _extract_bot_self_id(bot_token: str) -> int:
 
 BOT_SELF_ID = _extract_bot_self_id(BOT_TOKEN)
 
-# Không để webhook trần khi deploy production.
-# Nếu chưa set env, tự sinh secret ổn định theo BOT_TOKEN.
-if not TELEGRAM_WEBHOOK_SECRET and BOT_TOKEN:
-    TELEGRAM_WEBHOOK_SECRET = hashlib.sha256(
-        f"telegram-webhook:{BOT_TOKEN}".encode("utf-8")
-    ).hexdigest()[:48]
-    print("⚠️ TELEGRAM_WEBHOOK_SECRET chưa set -> dùng secret nội bộ tự sinh. Khuyến nghị set biến này trong Railway.")
+# Không tự sinh secret/path từ BOT_TOKEN để tránh rò theo chuỗi suy diễn.
+if not TELEGRAM_WEBHOOK_SECRET:
+    print("⚠️ TELEGRAM_WEBHOOK_SECRET chưa set -> webhook sẽ bị chặn (fail-closed).")
 
 PG_POOL_MIN = max(1, _env_int("PG_POOL_MIN", 1))
 PG_POOL_MAX = max(PG_POOL_MIN, _env_int("PG_POOL_MAX", 20))
@@ -152,8 +148,6 @@ USER_CALLBACK_RATE_WINDOW = max(5, _env_int("USER_CALLBACK_RATE_WINDOW", 10))
 # WEBHOOK HARDENING
 WEBHOOK_MAX_BODY_BYTES = max(4096, _env_int("WEBHOOK_MAX_BODY_BYTES", 262144))
 TELEGRAM_WEBHOOK_PATH_TOKEN = os.getenv("TELEGRAM_WEBHOOK_PATH_TOKEN", "").strip()
-TELEGRAM_WEBHOOK_REQUIRE_PATH_TOKEN = _env_bool("TELEGRAM_WEBHOOK_REQUIRE_PATH_TOKEN", True)
-TELEGRAM_WEBHOOK_ALLOW_PATH_TOKEN_ONLY = _env_bool("TELEGRAM_WEBHOOK_ALLOW_PATH_TOKEN_ONLY", False)
 WEBHOOK_INFLIGHT_LIMIT = max(
     TELEGRAM_UPDATE_WORKERS,
     _env_int("WEBHOOK_INFLIGHT_LIMIT", TELEGRAM_UPDATE_WORKERS * 6),
@@ -177,17 +171,15 @@ TELEGRAM_VI_ALLOWED_LANGS = tuple(
     if x.strip()
 ) or ("vi",)
 
-if not TELEGRAM_WEBHOOK_PATH_TOKEN and BOT_TOKEN:
-    TELEGRAM_WEBHOOK_PATH_TOKEN = hashlib.sha256(
-        f"telegram-webhook-path:{BOT_TOKEN}".encode("utf-8")
-    ).hexdigest()[:32]
+if not TELEGRAM_WEBHOOK_PATH_TOKEN:
+    print("⚠️ TELEGRAM_WEBHOOK_PATH_TOKEN chưa set -> webhook sẽ bị chặn (fail-closed).")
 
 app.config["MAX_CONTENT_LENGTH"] = WEBHOOK_MAX_BODY_BYTES
 print(
     "🔐 Webhook hardening:"
     f" path_token={'on' if TELEGRAM_WEBHOOK_PATH_TOKEN else 'off'}"
-    f", require_path={TELEGRAM_WEBHOOK_REQUIRE_PATH_TOKEN}"
-    f", allow_path_only={TELEGRAM_WEBHOOK_ALLOW_PATH_TOKEN_ONLY}"
+    f", strict_path={True}"
+    f", strict_secret={True}"
     f", body_limit={WEBHOOK_MAX_BODY_BYTES}"
     f", inflight_limit={WEBHOOK_INFLIGHT_LIMIT}"
     f", ip_permaban={WEBHOOK_IP_PERMABAN_ENABLED}"
@@ -198,8 +190,6 @@ if TELEGRAM_WEBHOOK_ENFORCE_IP_ALLOWLIST:
         "🔐 Telegram webhook IP allowlist ranges:"
         f" {', '.join(str(x) for x in TELEGRAM_WEBHOOK_IP_ALLOWLIST) or '(none)'}"
     )
-if TELEGRAM_WEBHOOK_ALLOW_PATH_TOKEN_ONLY:
-    print("⚠️ TELEGRAM_WEBHOOK_ALLOW_PATH_TOKEN_ONLY=1 -> webhook vẫn cho phép mode path-only (không khuyến nghị).")
 print(
     "🛡️ User policy:"
     f" spam_perm_first={SPAM_PERMANENT_ON_FIRST_HIT}"
@@ -270,19 +260,19 @@ def _is_valid_webhook_path(path_token: str) -> bool:
     incoming = (path_token or "").strip()
 
     if not TELEGRAM_WEBHOOK_PATH_TOKEN:
-        return incoming == ""
-
-    if incoming and _safe_equals(incoming, TELEGRAM_WEBHOOK_PATH_TOKEN):
-        return True
-
-    if TELEGRAM_WEBHOOK_REQUIRE_PATH_TOKEN:
         return False
 
-    return incoming == ""
+    return bool(incoming) and _safe_equals(incoming, TELEGRAM_WEBHOOK_PATH_TOKEN)
 
 def ensure_telegram_webhook(public_base_url_override: str = ""):
     if not BOT_TOKEN:
         print("⚠️ TELEGRAM_TOKEN trống -> không thể set Telegram webhook.")
+        return False
+    if not TELEGRAM_WEBHOOK_PATH_TOKEN:
+        print("⚠️ TELEGRAM_WEBHOOK_PATH_TOKEN trống -> bỏ qua set Telegram webhook.")
+        return False
+    if not TELEGRAM_WEBHOOK_SECRET:
+        print("⚠️ TELEGRAM_WEBHOOK_SECRET trống -> bỏ qua set Telegram webhook.")
         return False
 
     public_base_url = _normalize_public_url(public_base_url_override) or get_public_base_url()
@@ -294,9 +284,8 @@ def ensure_telegram_webhook(public_base_url_override: str = ""):
     payload = {
         "url": webhook_url,
         "allowed_updates": ["message", "callback_query"],
+        "secret_token": TELEGRAM_WEBHOOK_SECRET,
     }
-    if TELEGRAM_WEBHOOK_SECRET:
-        payload["secret_token"] = TELEGRAM_WEBHOOK_SECRET
 
     try:
         resp = requests.post(f"{BASE_URL}/setWebhook", json=payload, timeout=20)
@@ -5189,19 +5178,14 @@ def webhook(path_token=""):
         _record_webhook_ip_strike(client_ip, "invalid_path")
         return "Not Found", 404
 
-    if TELEGRAM_WEBHOOK_SECRET:
-        recv_secret = (request.headers.get("X-Telegram-Bot-Api-Secret-Token", "") or "").strip()
-        has_valid_secret = _safe_equals(recv_secret, TELEGRAM_WEBHOOK_SECRET)
+    if not TELEGRAM_WEBHOOK_SECRET:
+        return "server misconfigured", 503
 
-        if not has_valid_secret:
-            allow_path_token_only = (
-                TELEGRAM_WEBHOOK_ALLOW_PATH_TOKEN_ONLY
-                and bool(TELEGRAM_WEBHOOK_PATH_TOKEN)
-                and _safe_equals((path_token or "").strip(), TELEGRAM_WEBHOOK_PATH_TOKEN)
-            )
-            if not allow_path_token_only:
-                _record_webhook_ip_strike(client_ip, "invalid_secret")
-                return "Unauthorized", 401
+    recv_secret = (request.headers.get("X-Telegram-Bot-Api-Secret-Token", "") or "").strip()
+    has_valid_secret = _safe_equals(recv_secret, TELEGRAM_WEBHOOK_SECRET)
+    if not has_valid_secret:
+        _record_webhook_ip_strike(client_ip, "invalid_secret")
+        return "Unauthorized", 401
 
     limited, count = _rate_limit_exceeded(
         "webhook_ip",
