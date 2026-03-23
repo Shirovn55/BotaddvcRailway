@@ -241,24 +241,82 @@ def _normalize_public_url(raw_url: str) -> str:
         raw_url = f"https://{raw_url}"
     return raw_url.rstrip("/")
 
-def get_public_base_url() -> str:
+def _strip_webhook_suffix(base_url: str) -> str:
+    text = (base_url or "").strip()
+    if not text:
+        return ""
+    m = re.search(r"/webhook(?:/[^/]+)?$", text, re.IGNORECASE)
+    if m:
+        return text[:m.start()]
+    return text
+
+def _is_valid_webhook_base_url(base_url: str) -> bool:
+    try:
+        parsed = urllib.parse.urlparse((base_url or "").strip())
+    except Exception:
+        return False
+
+    scheme = (parsed.scheme or "").strip().lower()
+    host = (parsed.hostname or "").strip().lower()
+    port = parsed.port
+
+    if scheme != "https":
+        return False
+    if not host:
+        return False
+    if host in ("localhost", "127.0.0.1", "0.0.0.0", "::1"):
+        return False
+    if host.endswith(".local") or host.endswith(".internal"):
+        return False
+    if port and port not in (443, 80, 88, 8443):
+        return False
+
+    try:
+        ip_obj = ipaddress.ip_address(host)
+        if (
+            ip_obj.is_private
+            or ip_obj.is_loopback
+            or ip_obj.is_multicast
+            or ip_obj.is_reserved
+            or ip_obj.is_unspecified
+        ):
+            return False
+    except Exception:
+        pass
+
+    return True
+
+def _iter_public_base_urls():
     candidates = [
-        os.getenv("WEBHOOK_URL", "").strip(),
-        os.getenv("APP_URL", "").strip(),
-        os.getenv("RAILWAY_PUBLIC_URL", "").strip(),
-        os.getenv("RAILWAY_STATIC_URL", "").strip(),
-        os.getenv("RAILWAY_PUBLIC_DOMAIN", "").strip(),
+        ("WEBHOOK_URL", os.getenv("WEBHOOK_URL", "").strip()),
+        ("RAILWAY_PUBLIC_URL", os.getenv("RAILWAY_PUBLIC_URL", "").strip()),
+        ("RAILWAY_STATIC_URL", os.getenv("RAILWAY_STATIC_URL", "").strip()),
+        ("RAILWAY_PUBLIC_DOMAIN", os.getenv("RAILWAY_PUBLIC_DOMAIN", "").strip()),
+        ("APP_URL", os.getenv("APP_URL", "").strip()),
     ]
 
-    for raw_url in candidates:
-        base_url = _normalize_public_url(raw_url)
+    seen = set()
+    valid = []
+    invalid = []
+
+    for source, raw_url in candidates:
+        base_url = _strip_webhook_suffix(_normalize_public_url(raw_url))
         if not base_url:
             continue
-        m = re.search(r"/webhook(?:/[^/]+)?$", base_url, re.IGNORECASE)
-        if m:
-            return base_url[:m.start()]
-        return base_url
-    return ""
+        if base_url in seen:
+            continue
+        seen.add(base_url)
+
+        if _is_valid_webhook_base_url(base_url):
+            valid.append((source, base_url))
+        else:
+            invalid.append((source, base_url))
+
+    return valid, invalid
+
+def get_public_base_url() -> str:
+    valid, _invalid = _iter_public_base_urls()
+    return valid[0][1] if valid else ""
 
 def _safe_equals(a: str, b: str) -> bool:
     return bool(a) and bool(b) and hmac.compare_digest(str(a), str(b))
@@ -293,30 +351,45 @@ def ensure_telegram_webhook(public_base_url_override: str = ""):
         print("⚠️ TELEGRAM_WEBHOOK_SECRET trống -> bỏ qua set Telegram webhook.")
         return False
 
-    public_base_url = _normalize_public_url(public_base_url_override) or get_public_base_url()
-    if not public_base_url:
+    candidates = []
+    override_url = _strip_webhook_suffix(_normalize_public_url(public_base_url_override))
+    if override_url:
+        if _is_valid_webhook_base_url(override_url):
+            candidates.append(("override", override_url))
+        else:
+            print(f"⚠️ Bỏ qua public_base_url_override không hợp lệ: {override_url}")
+
+    auto_valid, auto_invalid = _iter_public_base_urls()
+    for source, base_url in auto_invalid:
+        print(f"⚠️ Bỏ qua webhook base URL không hợp lệ từ {source}: {base_url}")
+    for item in auto_valid:
+        if item not in candidates:
+            candidates.append(item)
+
+    if not candidates:
         print("⚠️ Chưa có APP_URL / WEBHOOK_URL / RAILWAY_PUBLIC_URL / RAILWAY_PUBLIC_DOMAIN -> bỏ qua set Telegram webhook.")
         return False
 
-    webhook_url = f"{public_base_url}{_build_webhook_path()}"
-    payload = {
-        "url": webhook_url,
-        "allowed_updates": ["message", "callback_query"],
-        "secret_token": TELEGRAM_WEBHOOK_SECRET,
-    }
+    for source, public_base_url in candidates:
+        webhook_url = f"{public_base_url}{_build_webhook_path()}"
+        payload = {
+            "url": webhook_url,
+            "allowed_updates": ["message", "callback_query"],
+            "secret_token": TELEGRAM_WEBHOOK_SECRET,
+        }
 
-    try:
-        resp = requests.post(f"{BASE_URL}/setWebhook", json=payload, timeout=20)
-        data = resp.json()
-        if resp.ok and data.get("ok"):
-            print(f"✅ Telegram webhook active: {_mask_webhook_url(webhook_url)}")
-            return True
-        else:
-            print(f"⚠️ setWebhook failed: status={resp.status_code} body={data}")
-            return False
-    except Exception as e:
-        print(f"⚠️ setWebhook error: {e}")
-        return False
+        print(f"🔗 Trying Telegram webhook via {source}: {_mask_webhook_url(webhook_url)}")
+        try:
+            resp = requests.post(f"{BASE_URL}/setWebhook", json=payload, timeout=20)
+            data = resp.json()
+            if resp.ok and data.get("ok"):
+                print(f"✅ Telegram webhook active via {source}: {_mask_webhook_url(webhook_url)}")
+                return True
+            print(f"⚠️ setWebhook failed via {source}: status={resp.status_code} body={data}")
+        except Exception as e:
+            print(f"⚠️ setWebhook error via {source}: {e}")
+
+    return False
 
 # =========================================================
 # PG POOL + REDIS CLIENT
