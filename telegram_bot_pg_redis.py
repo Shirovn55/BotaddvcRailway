@@ -622,7 +622,6 @@ while retry_count < MAX_RETRIES and not connected:
 # =========================================================
 print("🔄 Initializing PostgreSQL + Redis...")
 system_init_pg_redis()
-_unban_bot_self_if_needed()
 
 # =========================================================
 # 🔥 PRELOAD USERS + ROW CACHE (chạy 1 lần khi khởi động)
@@ -5516,6 +5515,7 @@ def tool_log():
 # =========================================================
 # LOCAL RUNNER
 # =========================================================
+_unban_bot_self_if_needed()
 ensure_telegram_webhook()
 
 if __name__ == "__main__":
