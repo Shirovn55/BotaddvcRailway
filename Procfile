@@ -1,0 +1,1 @@
+web: gunicorn --bind 0.0.0.0:$PORT --worker-class gthread --threads 8 --workers 1 --timeout 30 --graceful-timeout 15 --keep-alive 2 --max-requests 1000 --max-requests-jitter 100 telegram_bot_pg_redis:app
