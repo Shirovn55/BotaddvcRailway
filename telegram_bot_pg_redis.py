@@ -4012,9 +4012,10 @@ def handle_update(update):
                     PROCESSED_MESSAGES.discard(old_msg)
                 dprint(f"🗑️ Cleaned {len(old_msgs)} old messages from cache")
 
-    # ✅ CHECK BAN STATUS
-    msg = update.get("message") or update.get("callback_query", {}).get("message", {})
-    from_user = msg.get("from") or update.get("callback_query", {}).get("from", {})
+    # ✅ CHECK BAN STATUS (ưu tiên actor thật của callback_query)
+    callback_query = update.get("callback_query") or {}
+    msg = update.get("message") or callback_query.get("message", {})
+    from_user = callback_query.get("from") or msg.get("from") or {}
     user_id = from_user.get("id")
 
     if not user_id:
@@ -4040,10 +4041,10 @@ def handle_update(update):
                 )
                 _notify_admin_policy_ban(user_id, username, f"non-vi ({lang_code or 'unknown'})")
 
-            chat_id = msg.get("chat", {}).get("id")
-            if chat_id:
+            policy_chat_id = msg.get("chat", {}).get("id")
+            if policy_chat_id:
                 tg_send(
-                    chat_id,
+                    policy_chat_id,
                     "⛔ Bot chỉ hỗ trợ người dùng Việt Nam."
                 )
             return
@@ -4069,9 +4070,9 @@ def handle_update(update):
 
         msg_text += "📞 <b>Liên hệ:</b> @BonBonxHPx"
 
-        chat_id = msg.get("chat", {}).get("id")
-        if chat_id:
-            tg_send(chat_id, msg_text)
+        ban_chat_id = msg.get("chat", {}).get("id")
+        if ban_chat_id:
+            tg_send(ban_chat_id, msg_text)
 
         return
 
