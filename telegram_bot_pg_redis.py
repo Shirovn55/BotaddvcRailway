@@ -147,6 +147,8 @@ USER_TEXT_RATE_LIMIT = max(8, _env_int("USER_TEXT_RATE_LIMIT", 15))
 USER_TEXT_RATE_WINDOW = max(5, _env_int("USER_TEXT_RATE_WINDOW", 20))
 USER_CALLBACK_RATE_LIMIT = max(6, _env_int("USER_CALLBACK_RATE_LIMIT", 12))
 USER_CALLBACK_RATE_WINDOW = max(5, _env_int("USER_CALLBACK_RATE_WINDOW", 10))
+TELEGRAM_AUDIT_LOG = _env_bool("TELEGRAM_AUDIT_LOG", True)
+TELEGRAM_AUDIT_LOG_MAXLEN = max(32, _env_int("TELEGRAM_AUDIT_LOG_MAXLEN", 120))
 
 # WEBHOOK HARDENING
 WEBHOOK_MAX_BODY_BYTES = max(4096, _env_int("WEBHOOK_MAX_BODY_BYTES", 262144))
@@ -207,6 +209,7 @@ print(
     "🛡️ User policy:"
     f" update_limit={USER_UPDATE_RATE_LIMIT}/{USER_UPDATE_RATE_WINDOW}s"
     f", update_ban={USER_UPDATE_BAN_TYPE}"
+    f", audit_log={TELEGRAM_AUDIT_LOG}"
     f" spam_perm_first={SPAM_PERMANENT_ON_FIRST_HIT}"
     f", vi_only={TELEGRAM_VI_ONLY_ENFORCE}"
     f", vi_langs={','.join(TELEGRAM_VI_ALLOWED_LANGS)}"
@@ -2564,6 +2567,113 @@ def _record_suspicious_webhook_event(client_ip, user_id, username, update_kind):
         return False
     return False
 
+def _audit_text(value):
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    text = re.sub(r"\s+", " ", text)
+    text = text.replace('"', "'")
+    if len(text) > TELEGRAM_AUDIT_LOG_MAXLEN:
+        text = text[:TELEGRAM_AUDIT_LOG_MAXLEN - 3] + "..."
+    return text
+
+def _summarize_telegram_update(update):
+    summary = {
+        "update_id": None,
+        "kind": "unknown",
+        "user_id": 0,
+        "username": "",
+        "chat_id": 0,
+        "message_id": 0,
+        "payload": "",
+    }
+    if not isinstance(update, dict):
+        return summary
+
+    summary["update_id"] = update.get("update_id")
+    summary["kind"] = _detect_update_kind(update)
+    actor_id, actor_username, actor_chat_id, actor_kind = _extract_update_actor(update)
+    if actor_id:
+        summary["user_id"] = actor_id
+    if actor_username:
+        summary["username"] = actor_username
+    if actor_chat_id:
+        summary["chat_id"] = actor_chat_id
+    if actor_kind and actor_kind != "unknown":
+        summary["kind"] = actor_kind
+
+    callback_query = update.get("callback_query") or {}
+    if isinstance(callback_query, dict) and callback_query:
+        summary["message_id"] = ((callback_query.get("message") or {}).get("message_id") or 0)
+        data = _audit_text(callback_query.get("data", ""))
+        if data:
+            summary["payload"] = f'data="{data}"'
+        return summary
+
+    message_like_keys = (
+        "message",
+        "edited_message",
+        "channel_post",
+        "edited_channel_post",
+        "business_message",
+        "edited_business_message",
+    )
+    for key in message_like_keys:
+        msg = update.get(key) or {}
+        if not isinstance(msg, dict) or not msg:
+            continue
+        summary["message_id"] = msg.get("message_id") or 0
+        text = _audit_text(msg.get("text") or msg.get("caption") or "")
+        if text:
+            summary["payload"] = f'text="{text}"'
+        return summary
+
+    return summary
+
+def _log_tg_event(event, update=None, reason="", extra=""):
+    if not TELEGRAM_AUDIT_LOG:
+        return
+
+    summary = _summarize_telegram_update(update)
+    parts = [f"[TG] event={event}"]
+
+    update_id = summary.get("update_id")
+    if update_id is not None:
+        parts.append(f"update_id={update_id}")
+
+    kind = summary.get("kind") or "unknown"
+    parts.append(f"kind={kind}")
+
+    user_id = summary.get("user_id") or 0
+    if user_id:
+        parts.append(f"user={user_id}")
+
+    username = _audit_text(summary.get("username", ""))
+    if username:
+        parts.append(f"usern=@{username}")
+
+    chat_id = summary.get("chat_id") or 0
+    if chat_id:
+        parts.append(f"chat={chat_id}")
+
+    message_id = summary.get("message_id") or 0
+    if message_id:
+        parts.append(f"msg={message_id}")
+
+    payload = summary.get("payload", "")
+    if payload:
+        parts.append(payload)
+
+    reason_text = _audit_text(reason)
+    if reason_text:
+        parts.append(f"reason={reason_text}")
+
+    extra_text = _audit_text(extra)
+    if extra_text:
+        parts.append(extra_text)
+
+    print(" ".join(parts))
+
 def _is_webhook_ip_banned(ip: str) -> bool:
     ip = (ip or "").strip()
     if not ip or ip == "unknown":
@@ -4411,6 +4521,7 @@ def handle_stats_command(chat_id, user_id):
 # =========================================================
 def handle_update(update):
     dprint("UPDATE:", update)
+    _log_tg_event("recv", update)
 
     # ✅ UPDATE_ID DEDUPLICATION - Tránh Telegram resend khi lag
     update_id = update.get("update_id")
@@ -4419,6 +4530,7 @@ def handle_update(update):
         with PROCESSED_UPDATE_IDS_LOCK:
             if update_id in PROCESSED_UPDATE_IDS:
                 dprint(f"⚠️ DUPLICATE UPDATE_ID DETECTED: {update_id} - SKIPPING")
+                _log_tg_event("drop", update, reason="duplicate_update")
                 return
 
             # ✅ deque tự động drop oldest khi đầy (maxlen=2000)
@@ -4436,6 +4548,7 @@ def handle_update(update):
         with PROCESSED_MESSAGES_LOCK:
             if msg_key in PROCESSED_MESSAGES:
                 dprint(f"⚠️ DUPLICATE MESSAGE DETECTED: {msg_key} - SKIPPING")
+                _log_tg_event("drop", update, reason="duplicate_message")
                 return
 
             PROCESSED_MESSAGES.add(msg_key)
@@ -4455,6 +4568,7 @@ def handle_update(update):
     policy_chat_id = msg.get("chat", {}).get("id")
 
     if not user_id:
+        _log_tg_event("drop", update, reason="missing_user")
         return
 
     is_bot_user = bool(from_user.get("is_bot"))
@@ -4465,6 +4579,7 @@ def handle_update(update):
     ban_status = check_ban_status(user_id)
 
     if ban_status["banned"]:
+        _log_tg_event("block", update, reason=f"banned:{ban_status['type']}")
         _send_banned_user_notice(
             policy_chat_id,
             user_id,
@@ -4479,6 +4594,7 @@ def handle_update(update):
             # language_code thiếu/unknown -> không auto-ban để tránh false-positive.
             dprint(f"vi-only skip unknown language: user={user_id}")
         elif not _is_vi_language_code(lang_code):
+            _log_tg_event("block", update, reason=f"non_vi:{lang_code}")
             _handle_non_vi_user(user_id, username, policy_chat_id, lang_code)
             return
 
@@ -4490,6 +4606,12 @@ def handle_update(update):
             USER_UPDATE_RATE_WINDOW
         )
         if limited:
+            _log_tg_event(
+                "ban",
+                update,
+                reason="user_update_flood",
+                extra=f"count={count}/{USER_UPDATE_RATE_LIMIT}"
+            )
             _handle_global_user_flood(user_id, username, count)
             return
 
@@ -5571,9 +5693,11 @@ def webhook(path_token=""):
     update = request.get_json(force=True, silent=True) or {}
     if not update:
         _record_suspicious_webhook_event(client_ip, 0, "", "empty_update")
+        _log_tg_event("drop", None, reason="empty_update", extra=f"ip={client_ip}")
         return "bad request", 400
     if "update_id" not in update:
         _record_suspicious_webhook_event(client_ip, 0, "", "missing_update_id")
+        _log_tg_event("drop", update, reason="missing_update_id", extra=f"ip={client_ip}")
         return "bad request", 400
 
     actor_user_id, actor_username, _actor_chat_id, update_kind = _extract_update_actor(update)
@@ -5588,12 +5712,24 @@ def webhook(path_token=""):
             f"⚠️ Ignored suspicious webhook kind={update_kind} "
             f"user={actor_user_id or 'unknown'} ip={client_ip} banned={banned}"
         )
+        _log_tg_event(
+            "drop",
+            update,
+            reason=f"suspicious:{update_kind}",
+            extra=f"ip={client_ip} banned={banned}"
+        )
         return "ok", 200
 
     if not WEBHOOK_INFLIGHT_SEM.acquire(blocking=False):
         dprint(
             f"⚠️ Webhook overload -> drop update_id={update.get('update_id')} "
             f"inflight_limit={WEBHOOK_INFLIGHT_LIMIT}"
+        )
+        _log_tg_event(
+            "drop",
+            update,
+            reason="webhook_overload",
+            extra=f"inflight_limit={WEBHOOK_INFLIGHT_LIMIT}"
         )
         return "ok", 200
 
