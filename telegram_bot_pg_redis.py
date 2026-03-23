@@ -17,6 +17,7 @@ import json
 import re
 import hashlib
 import hmac
+import ipaddress
 import unicodedata
 import requests
 import random  # ✅ THÊM RANDOM CHO CHECK VOUCHER
@@ -92,6 +93,27 @@ def _env_bool(name, default=False):
         return bool(default)
     return str(raw).strip().lower() in ("1", "true", "yes", "on")
 
+def _env_cidr_list(name, default):
+    raw = os.getenv(name)
+    txt = str(default if raw is None else raw or "").strip()
+    if not txt:
+        return tuple()
+
+    cidrs = []
+    invalid = []
+    for item in re.split(r"[\s,;]+", txt):
+        token = item.strip()
+        if not token:
+            continue
+        try:
+            cidrs.append(ipaddress.ip_network(token, strict=False))
+        except Exception:
+            invalid.append(token)
+
+    if invalid:
+        print(f"⚠️ {name} chứa CIDR không hợp lệ, sẽ bỏ qua: {', '.join(invalid)}")
+    return tuple(cidrs)
+
 def _extract_bot_self_id(bot_token: str) -> int:
     token = (bot_token or "").strip()
     if not token:
@@ -139,6 +161,11 @@ WEBHOOK_INFLIGHT_LIMIT = max(
 WEBHOOK_IP_PERMABAN_ENABLED = _env_bool("WEBHOOK_IP_PERMABAN_ENABLED", True)
 WEBHOOK_IP_STRIKE_LIMIT = max(10, _env_int("WEBHOOK_IP_STRIKE_LIMIT", 40))
 WEBHOOK_IP_STRIKE_WINDOW = max(10, _env_int("WEBHOOK_IP_STRIKE_WINDOW", 120))
+TELEGRAM_WEBHOOK_ENFORCE_IP_ALLOWLIST = _env_bool("TELEGRAM_WEBHOOK_ENFORCE_IP_ALLOWLIST", True)
+TELEGRAM_WEBHOOK_IP_ALLOWLIST = _env_cidr_list(
+    "TELEGRAM_WEBHOOK_IP_ALLOWLIST",
+    "149.154.160.0/20,91.108.4.0/22",
+)
 
 # TELEGRAM USER POLICY (VI ONLY - NO LANGUAGE AUTO-BAN)
 SPAM_PERMANENT_ON_FIRST_HIT = _env_bool("SPAM_PERMANENT_ON_FIRST_HIT", True)
@@ -163,7 +190,13 @@ print(
     f", body_limit={WEBHOOK_MAX_BODY_BYTES}"
     f", inflight_limit={WEBHOOK_INFLIGHT_LIMIT}"
     f", ip_permaban={WEBHOOK_IP_PERMABAN_ENABLED}"
+    f", ip_allowlist={TELEGRAM_WEBHOOK_ENFORCE_IP_ALLOWLIST}"
 )
+if TELEGRAM_WEBHOOK_ENFORCE_IP_ALLOWLIST:
+    print(
+        "🔐 Telegram webhook IP allowlist ranges:"
+        f" {', '.join(str(x) for x in TELEGRAM_WEBHOOK_IP_ALLOWLIST) or '(none)'}"
+    )
 print(
     "🛡️ User policy:"
     f" spam_perm_first={SPAM_PERMANENT_ON_FIRST_HIT}"
@@ -2117,14 +2150,69 @@ def _rate_limit_exceeded(bucket, key, limit, window_sec):
         ticks.append(now)
         return len(ticks) > limit, len(ticks)
 
+def _to_valid_ip(ip_text: str) -> str:
+    raw = (ip_text or "").strip()
+    if not raw:
+        return ""
+
+    # Chuẩn hóa IPv4-mapped IPv6 từ proxy (vd: ::ffff:1.2.3.4)
+    if raw.lower().startswith("::ffff:"):
+        raw = raw.split(":", 3)[-1].strip()
+
+    # Bóc [] hoặc :port khi proxy trả về dạng [IPv6]:port / IPv4:port
+    if raw.startswith("[") and "]" in raw:
+        raw = raw[1:raw.find("]")]
+    elif "." in raw and ":" in raw:
+        host, sep, port = raw.rpartition(":")
+        if sep and port.isdigit():
+            raw = host.strip()
+
+    try:
+        return str(ipaddress.ip_address(raw))
+    except Exception:
+        return ""
+
 def _extract_client_ip():
-    xff = (request.headers.get("X-Forwarded-For", "") or "").split(",")[0].strip()
-    if xff:
-        return xff
-    real_ip = (request.headers.get("X-Real-IP", "") or "").strip()
+    xff_raw = (request.headers.get("X-Forwarded-For", "") or "").strip()
+    if xff_raw:
+        # Duyệt từ phải qua trái để giảm nguy cơ spoof XFF ở vị trí đầu.
+        for piece in reversed([x.strip() for x in xff_raw.split(",") if x.strip()]):
+            normalized = _to_valid_ip(piece)
+            if normalized:
+                return normalized
+
+    real_ip = _to_valid_ip(request.headers.get("X-Real-IP", "") or "")
     if real_ip:
         return real_ip
-    return (request.remote_addr or "unknown").strip() or "unknown"
+
+    remote_ip = _to_valid_ip(request.remote_addr or "")
+    if remote_ip:
+        return remote_ip
+
+    return "unknown"
+
+def _is_telegram_webhook_ip_allowed(ip: str) -> bool:
+    if not TELEGRAM_WEBHOOK_ENFORCE_IP_ALLOWLIST:
+        return True
+    if not TELEGRAM_WEBHOOK_IP_ALLOWLIST:
+        return False
+
+    normalized = _to_valid_ip(ip)
+    if not normalized:
+        return False
+
+    try:
+        ip_obj = ipaddress.ip_address(normalized)
+    except Exception:
+        return False
+
+    for net in TELEGRAM_WEBHOOK_IP_ALLOWLIST:
+        try:
+            if ip_obj.version == net.version and ip_obj in net:
+                return True
+        except Exception:
+            continue
+    return False
 
 def _is_vi_language_code(lang_code: str) -> bool:
     lc = (lang_code or "").strip().lower()
@@ -5147,6 +5235,10 @@ def webhook(path_token=""):
     client_ip = _extract_client_ip()
 
     if _is_webhook_ip_banned(client_ip):
+        return "forbidden", 403
+
+    if not _is_telegram_webhook_ip_allowed(client_ip):
+        _record_webhook_ip_strike(client_ip, "ip_not_allowed")
         return "forbidden", 403
 
     if not _is_valid_webhook_path(path_token):
