@@ -260,6 +260,12 @@ def _build_webhook_path() -> str:
         return f"/webhook/{TELEGRAM_WEBHOOK_PATH_TOKEN}"
     return "/webhook"
 
+def _mask_webhook_url(url: str) -> str:
+    text = (url or "").strip()
+    if not text:
+        return ""
+    return re.sub(r"(/webhook/)[^/?#]+", r"\1<hidden>", text)
+
 def _is_valid_webhook_path(path_token: str) -> bool:
     incoming = (path_token or "").strip()
 
@@ -296,7 +302,7 @@ def ensure_telegram_webhook(public_base_url_override: str = ""):
         resp = requests.post(f"{BASE_URL}/setWebhook", json=payload, timeout=20)
         data = resp.json()
         if resp.ok and data.get("ok"):
-            print(f"✅ Telegram webhook active: {webhook_url}")
+            print(f"✅ Telegram webhook active: {_mask_webhook_url(webhook_url)}")
             return True
         else:
             print(f"⚠️ setWebhook failed: status={resp.status_code} body={data}")
@@ -5339,6 +5345,7 @@ def home():
 # Bảo vệ bằng header X-Tool-Key
 # =========================================================
 TOOL_API_KEY = os.getenv("TOOL_API_KEY", "").strip()
+TOOL_DEBUG_ENDPOINT_ENABLED = _env_bool("TOOL_DEBUG_ENDPOINT_ENABLED", False)
 
 def _tool_auth():
     """Verify X-Tool-Key. Returns (True, None) hoặc (False, error_response)"""
@@ -5346,13 +5353,20 @@ def _tool_auth():
         return False, ({"ok": False, "error": "TOOL_API_KEY not configured on server"}, 500)
     received = request.headers.get("X-Tool-Key", "").strip()
     if received != TOOL_API_KEY:
-        print(f"[TOOL AUTH FAIL] received='{received}' ({len(received)}ch) expect='{TOOL_API_KEY}' ({len(TOOL_API_KEY)}ch) path={request.path}")
+        print(
+            "[TOOL AUTH FAIL] "
+            f"path={request.path} ip={_extract_client_ip()} "
+            f"received_len={len(received)} expected_len={len(TOOL_API_KEY)}"
+        )
         return False, ({"ok": False, "error": f"Unauthorized — server key {len(TOOL_API_KEY)}ch, received {len(received)}ch"}, 401)
     return True, None
 
 @app.route("/tool/debug", methods=["GET"])
 def tool_debug():
     """Temp debug — xem key server đang hold"""
+    if not TOOL_DEBUG_ENDPOINT_ENABLED:
+        return {"ok": False, "error": "Not Found"}, 404
+
     ok, error = _tool_auth()
     if not ok:
         return error
@@ -5360,9 +5374,7 @@ def tool_debug():
     k = TOOL_API_KEY
     return {
         "tool_api_key_len": len(k),
-        "tool_api_key_first3": k[:3],
-        "tool_api_key_last2": k[-2:] if len(k) >= 2 else k,
-        "tool_api_key_repr": repr(k)
+        "tool_api_key_sha256_12": hashlib.sha256(k.encode("utf-8")).hexdigest()[:12] if k else ""
     }, 200
 
 
