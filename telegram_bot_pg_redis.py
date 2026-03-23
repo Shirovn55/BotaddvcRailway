@@ -176,15 +176,16 @@ ADMIN_COMMAND_REQUIRE_PRIVATE_CHAT = _env_bool("ADMIN_COMMAND_REQUIRE_PRIVATE_CH
 
 # TELEGRAM USER POLICY (VI ONLY - NO LANGUAGE AUTO-BAN)
 SPAM_PERMANENT_ON_FIRST_HIT = _env_bool("SPAM_PERMANENT_ON_FIRST_HIT", True)
-TELEGRAM_VI_ONLY_ENFORCE = _env_bool("TELEGRAM_VI_ONLY_ENFORCE", True)
+TELEGRAM_VI_ONLY_ENFORCE = False
 TELEGRAM_VI_ALLOWED_LANGS = tuple(
     x.strip().lower()
     for x in (os.getenv("TELEGRAM_VI_ALLOWED_LANGS", "vi") or "vi").split(",")
     if x.strip()
 ) or ("vi",)
-NON_VI_AUTO_BAN = _env_bool("NON_VI_AUTO_BAN", True)
+NON_VI_AUTO_BAN = False
 NON_VI_NOTICE_COOLDOWN = max(0, _env_int("NON_VI_NOTICE_COOLDOWN", 21600))
 BANNED_USER_NOTICE_COOLDOWN = max(0, _env_int("BANNED_USER_NOTICE_COOLDOWN", 3600))
+UNBAN_ALL_BLOCKED_USERS_ON_BOOT = _env_bool("UNBAN_ALL_BLOCKED_USERS_ON_BOOT", True)
 
 if not TELEGRAM_WEBHOOK_PATH_TOKEN:
     print("⚠️ TELEGRAM_WEBHOOK_PATH_TOKEN chưa set -> webhook sẽ bị chặn (fail-closed).")
@@ -219,6 +220,7 @@ print(
     f", non_vi_autoban={NON_VI_AUTO_BAN}"
     f", non_vi_notice_cd={NON_VI_NOTICE_COOLDOWN}s"
     f", banned_notice_cd={BANNED_USER_NOTICE_COOLDOWN}s"
+    f", unban_all_on_boot={UNBAN_ALL_BLOCKED_USERS_ON_BOOT}"
     f", admin_private={ADMIN_COMMAND_REQUIRE_PRIVATE_CHAT}"
 )
 if BOT_SELF_ID:
@@ -3252,6 +3254,72 @@ def unban_user(user_id, admin_id=0):
     dprint(f"✅ Unbanned user {user_id} (from {old_status}) by admin {admin_id}")
     return True, old_status
 
+def _release_all_blocked_users(note_prefix="auto-unban on boot", notify_admin=True):
+    if PG_POOL is None:
+        dprint("Bỏ qua mass-unban: PG chưa sẵn sàng.")
+        return 0
+
+    rows = pg_exec(
+        """
+        SELECT tele_id, status
+        FROM wallet
+        WHERE status IN ('banned', 'ban_1h', 'banned_qr_spam')
+        ORDER BY tele_id
+        """,
+        fetchall=True
+    ) or []
+
+    if not rows:
+        print("✅ Mass-unban on boot: không có user bị khóa.")
+        return 0
+
+    user_ids = [int(row[0]) for row in rows if row and row[0]]
+    updated = pg_exec_rowcount(
+        """
+        UPDATE wallet
+        SET status='active',
+            notes=%s,
+            updated_at=NOW()
+        WHERE status IN ('banned', 'ban_1h', 'banned_qr_spam')
+        """,
+        (f"{note_prefix} {now_str()}",)
+    )
+
+    for user_id in user_ids:
+        try:
+            clear_user_ban_trackers(user_id)
+        except Exception as e:
+            dprint(f"mass-unban clear tracker error user={user_id}: {e}")
+
+    dprint(f"✅ Mass-unban: released={updated} users")
+
+    if notify_admin and ADMIN_ID and int(ADMIN_ID) > 0:
+        try:
+            tg_send(
+                ADMIN_ID,
+                "✅ <b>MASS UNBAN HOÀN TẤT</b>\n\n"
+                f"Đã mở chặn <b>{updated}</b> user bị khóa.\n"
+                "Policy chặn non-VI đã được tắt."
+            )
+        except Exception as e:
+            dprint(f"mass-unban notify admin error: {e}")
+
+    return int(updated or 0)
+
+def release_all_blocked_users_on_boot():
+    if not UNBAN_ALL_BLOCKED_USERS_ON_BOOT:
+        return 0
+    if PG_POOL is None:
+        print("⚠️ Bỏ qua mass-unban: PG chưa sẵn sàng.")
+        return 0
+
+    updated = _release_all_blocked_users(note_prefix="auto-unban on boot", notify_admin=True)
+    if updated > 0:
+        print(f"✅ Mass-unban on boot: released={updated} users")
+    else:
+        print("✅ Mass-unban on boot: không có user bị khóa.")
+    return updated
+
 def get_user_row(user_id):
     """
     ✅ V4: Cache-first, giảm 80% Sheet API calls
@@ -5102,6 +5170,28 @@ def handle_update(update):
         )
         return
 
+    # ===== ADMIN: /unbanall =====
+    if text == "/unbanall":
+        if not _is_admin_context(user_id, chat_id):
+            _send_admin_denied(chat_id)
+            return
+
+        if PG_POOL is None:
+            tg_send(chat_id, "❌ PostgreSQL chưa sẵn sàng, không thể unban hàng loạt lúc này.")
+            return
+
+        released = _release_all_blocked_users(
+            note_prefix=f"UNBAN_ALL by admin {user_id}",
+            notify_admin=False
+        )
+        log_row(user_id, username, "ADMIN_UNBAN_ALL", str(released), "Mở chặn toàn bộ user bị khóa")
+        tg_send(
+            chat_id,
+            "✅ <b>UNBAN ALL HOÀN TẤT</b>\n\n"
+            f"Đã mở chặn <b>{released}</b> user đang bị khóa."
+        )
+        return
+
     if not text:
         if user_id not in PENDING_VOUCHER:
             return
@@ -6031,6 +6121,7 @@ def tool_removed(_unused=""):
 # LOCAL RUNNER
 # =========================================================
 _unban_bot_self_if_needed()
+release_all_blocked_users_on_boot()
 ensure_telegram_webhook()
 
 if __name__ == "__main__":
