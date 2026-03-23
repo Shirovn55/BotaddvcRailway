@@ -153,7 +153,7 @@ USER_CALLBACK_RATE_WINDOW = max(5, _env_int("USER_CALLBACK_RATE_WINDOW", 10))
 WEBHOOK_MAX_BODY_BYTES = max(4096, _env_int("WEBHOOK_MAX_BODY_BYTES", 262144))
 TELEGRAM_WEBHOOK_PATH_TOKEN = os.getenv("TELEGRAM_WEBHOOK_PATH_TOKEN", "").strip()
 TELEGRAM_WEBHOOK_REQUIRE_PATH_TOKEN = _env_bool("TELEGRAM_WEBHOOK_REQUIRE_PATH_TOKEN", True)
-TELEGRAM_WEBHOOK_ALLOW_PATH_TOKEN_ONLY = _env_bool("TELEGRAM_WEBHOOK_ALLOW_PATH_TOKEN_ONLY", True)
+TELEGRAM_WEBHOOK_ALLOW_PATH_TOKEN_ONLY = _env_bool("TELEGRAM_WEBHOOK_ALLOW_PATH_TOKEN_ONLY", False)
 WEBHOOK_INFLIGHT_LIMIT = max(
     TELEGRAM_UPDATE_WORKERS,
     _env_int("WEBHOOK_INFLIGHT_LIMIT", TELEGRAM_UPDATE_WORKERS * 6),
@@ -166,6 +166,7 @@ TELEGRAM_WEBHOOK_IP_ALLOWLIST = _env_cidr_list(
     "TELEGRAM_WEBHOOK_IP_ALLOWLIST",
     "149.154.160.0/20,91.108.4.0/22",
 )
+ADMIN_COMMAND_REQUIRE_PRIVATE_CHAT = _env_bool("ADMIN_COMMAND_REQUIRE_PRIVATE_CHAT", True)
 
 # TELEGRAM USER POLICY (VI ONLY - NO LANGUAGE AUTO-BAN)
 SPAM_PERMANENT_ON_FIRST_HIT = _env_bool("SPAM_PERMANENT_ON_FIRST_HIT", True)
@@ -197,11 +198,14 @@ if TELEGRAM_WEBHOOK_ENFORCE_IP_ALLOWLIST:
         "🔐 Telegram webhook IP allowlist ranges:"
         f" {', '.join(str(x) for x in TELEGRAM_WEBHOOK_IP_ALLOWLIST) or '(none)'}"
     )
+if TELEGRAM_WEBHOOK_ALLOW_PATH_TOKEN_ONLY:
+    print("⚠️ TELEGRAM_WEBHOOK_ALLOW_PATH_TOKEN_ONLY=1 -> webhook vẫn cho phép mode path-only (không khuyến nghị).")
 print(
     "🛡️ User policy:"
     f" spam_perm_first={SPAM_PERMANENT_ON_FIRST_HIT}"
     f", vi_only={TELEGRAM_VI_ONLY_ENFORCE}"
     f", vi_langs={','.join(TELEGRAM_VI_ALLOWED_LANGS)}"
+    f", admin_private={ADMIN_COMMAND_REQUIRE_PRIVATE_CHAT}"
 )
 if BOT_SELF_ID:
     print(f"🤖 Bot self id detected: {BOT_SELF_ID}")
@@ -2214,6 +2218,28 @@ def _is_telegram_webhook_ip_allowed(ip: str) -> bool:
             continue
     return False
 
+def _is_admin_user(user_id) -> bool:
+    try:
+        return int(ADMIN_ID) > 0 and int(user_id) == int(ADMIN_ID)
+    except Exception:
+        return False
+
+def _is_admin_context(user_id, chat_id=None) -> bool:
+    if not _is_admin_user(user_id):
+        return False
+    if not ADMIN_COMMAND_REQUIRE_PRIVATE_CHAT:
+        return True
+    try:
+        return int(chat_id) == int(ADMIN_ID)
+    except Exception:
+        return False
+
+def _send_admin_denied(chat_id):
+    if ADMIN_COMMAND_REQUIRE_PRIVATE_CHAT:
+        tg_send(chat_id, "⛔ Chỉ admin (chat riêng).")
+    else:
+        tg_send(chat_id, "⛔ Chỉ admin")
+
 def _is_vi_language_code(lang_code: str) -> bool:
     lc = (lang_code or "").strip().lower()
     if not lc:
@@ -3996,8 +4022,8 @@ def format_tongket_message(stats):
     return msg
 
 def handle_tongket_command(chat_id, user_id):
-    if user_id != ADMIN_ID:
-        tg_send(chat_id, "⛔ Chỉ admin")
+    if not _is_admin_context(user_id, chat_id):
+        _send_admin_denied(chat_id)
         return
 
     tg_send(chat_id, "⏳ Đang tổng hợp dữ liệu...")
@@ -4015,8 +4041,8 @@ def handle_tongket_command(chat_id, user_id):
 # =========================================================
 def handle_stats_command(chat_id, user_id):
     """Admin command: xem cache stats"""
-    if user_id != ADMIN_ID:
-        tg_send(chat_id, "⛔ Chỉ admin")
+    if not _is_admin_context(user_id, chat_id):
+        _send_admin_denied(chat_id)
         return
 
     stats = f"""📊 <b>CACHE STATISTICS</b>
@@ -4096,7 +4122,7 @@ def handle_update(update):
         # Không áp policy/anti-spam cho bot account.
         return
 
-    if TELEGRAM_VI_ONLY_ENFORCE and int(user_id) != int(ADMIN_ID):
+    if TELEGRAM_VI_ONLY_ENFORCE and not _is_admin_user(user_id):
         lang_code = str(from_user.get("language_code", "") or "").strip().lower()
         if not lang_code:
             # language_code thiếu/unknown -> không auto-ban để tránh false-positive.
@@ -4193,8 +4219,8 @@ def handle_update(update):
 
     # /update
     if text == "/update":
-        if user_id != ADMIN_ID:
-            tg_send(chat_id, "⛔ Chỉ admin")
+        if not _is_admin_context(user_id, chat_id):
+            _send_admin_denied(chat_id)
             return
 
         global VOUCHER_KEYBOARD_CACHE
@@ -4218,8 +4244,8 @@ def handle_update(update):
 
     # ===== ADMIN: /congtien <tele_id> <sotien> =====
     if text and text.startswith("/congtien"):
-        if user_id != ADMIN_ID:
-            tg_send(chat_id, "⛔ Lệnh này chỉ dành cho Admin")
+        if not _is_admin_context(user_id, chat_id):
+            _send_admin_denied(chat_id)
             return
 
         parts = text.split()
@@ -4266,8 +4292,8 @@ def handle_update(update):
 
     # ===== ADMIN: /trutien <tele_id> <sotien> =====
     if text and text.startswith("/trutien"):
-        if user_id != ADMIN_ID:
-            tg_send(chat_id, "⛔ Lệnh này chỉ dành cho Admin")
+        if not _is_admin_context(user_id, chat_id):
+            _send_admin_denied(chat_id)
             return
 
         parts = text.split()
@@ -4318,8 +4344,8 @@ def handle_update(update):
 
     # ===== ADMIN: /unban <tele_id> =====
     if text and text.startswith("/unban"):
-        if user_id != ADMIN_ID:
-            tg_send(chat_id, "⛔ Lệnh này chỉ dành cho Admin")
+        if not _is_admin_context(user_id, chat_id):
+            _send_admin_denied(chat_id)
             return
 
         parts = text.split()
@@ -4377,8 +4403,8 @@ def handle_update(update):
 
     # ===== ADMIN: /thongbao =====
     if text and text.startswith("/thongbao"):
-        if user_id != ADMIN_ID:
-            tg_send(chat_id, "⛔ Lệnh này chỉ dành cho Admin")
+        if not _is_admin_context(user_id, chat_id):
+            _send_admin_denied(chat_id)
             return
 
         message_id = msg.get("message_id", 0)
@@ -5327,6 +5353,10 @@ def _tool_auth():
 @app.route("/tool/debug", methods=["GET"])
 def tool_debug():
     """Temp debug — xem key server đang hold"""
+    ok, error = _tool_auth()
+    if not ok:
+        return error
+
     k = TOOL_API_KEY
     return {
         "tool_api_key_len": len(k),
