@@ -927,7 +927,6 @@ def build_main_keyboard(is_active=True):
             ["💎 Nạp tiền", "💰 Số dư"],
             ["🎁 Lưu Voucher", "📊 Check Voucher"],
             ["🔑 Get Cookie QR", "🧩 Hệ Thống Bot"],  # ✅ GỘP VÀO 1 HÀNG
-            ["🖥️ Tải & Lấy Pass Tool ADD PC"]
         ],
         "resize_keyboard": True
     }
@@ -1203,34 +1202,6 @@ def handle_check_voucher(user_id, username):
         except Exception as e:
             dprint(f"Log error: {e}")
 
-
-def get_tool_pc_link():
-    """
-    Lấy link Tool PC từ cột 'toolpc' trong VoucherStock
-    Trả về link hoặc None nếu không tìm thấy
-    """
-    if not SHEET_READY or ws_voucher is None:
-        return None
-    
-    try:
-        rows = ws_voucher.get_all_records()
-        
-        # Tìm link trong cột 'toolpc'
-        for row in rows:
-            # Flexible column mapping
-            for key in row:
-                if str(key).strip().lower() == "toolpc":
-                    link = str(row[key]).strip()
-                    if link and (link.startswith("http://") or link.startswith("https://")):
-                        dprint(f"✅ Tìm thấy link Tool PC: {link}")
-                        return link
-        
-        dprint("⚠️ Không tìm thấy link Tool PC trong cột 'toolpc'")
-        return None
-        
-    except Exception as e:
-        dprint(f"get_tool_pc_link error: {e}")
-        return None
 
 # =========================================================
 # 🔥 QR LOGIN FUNCTIONS
@@ -4629,65 +4600,6 @@ def handle_update(update):
         tg_send(chat_id, topup_history_text(user_id))
         return
 
-    # ===== TẢI & LẤY PASS TOOL ADD PC =====
-    if text == "🖥️ Tải & Lấy Pass Tool ADD PC":
-        if PG_POOL is None:
-            tg_send(chat_id, "❌ Hệ thống đang lỗi. Thử lại sau.")
-            return
-
-        import secrets
-        new_pass = secrets.token_hex(8)  # 16 ký tự hex ngẫu nhiên
-
-        pg_exec("UPDATE wallet SET pass=%s, updated_at=NOW() WHERE tele_id=%s", (new_pass, int(user_id)))
-
-        # mirror sheet (fire-and-forget)
-        if SHEET_READY:
-            try:
-                row = get_user_row(user_id)
-                if row:
-                    # cột 7 = pass
-                    ws_money.update_cell(row, 7, new_pass)
-            except Exception:
-                pass
-
-        # ✅ LẤY LINK TOOL ĐỘNG TỪ VOUCHERSTOCK
-        tool_link = get_tool_pc_link()
-        
-        if not tool_link:
-            # Fallback link mặc định nếu không tìm thấy
-            tool_link = "https://t.me/botxshopee/2580"
-            dprint("⚠️ Dùng link Tool PC mặc định (không tìm thấy trong sheet)")
-
-        tg_send(
-            chat_id,
-            f"🖥️ <b>TOOL ADD VOUCHER PC</b>\n\n"
-            f"📋 <b>Telegram ID:</b> <code>{user_id}</code>\n"
-            f"🔐 <b>Password:</b> <code>{new_pass}</code>\n\n"
-            f"━━━━━━━━━━━━━━━━━━\n\n"
-            f"📥 <b>TẢI TOOL:</b>\n"
-            f"🔗 <a href='{tool_link}'>Tải ToolADDPC.exe</a>\n\n"
-            f"━━━━━━━━━━━━━━━━━━\n\n"
-            f"📖 <b>HƯỚNG DẪN SỬ DỤNG:</b>\n"
-            f"1️⃣ Bấm link bên trên để tải file\n"
-            f"2️⃣ Chạy ToolADDPC.exe\n"
-            f"3️⃣ Nhập Telegram ID + Password (copy bên trên)\n"
-            f"4️⃣ Bấm LOGIN và bắt đầu lưu voucher\n\n"
-            f"💡 <b>Tính năng:</b>\n"
-            f"• Lưu nhiều voucher cùng lúc\n"
-            f"• Hỗ trợ nhiều cookie\n"
-            f"• Get Cookie QR ngay trong tool\n"
-            f"• Tự động trừ tiền từ số dư bot\n\n"
-            f"⚠️ <b>Lưu ý:</b>\n"
-            f"• Windows có thể cảnh báo → Bấm 'Run anyway'\n"
-            f"• Mỗi lần bấm nút sẽ tạo Password mới\n"
-            f"• Tool chỉ chạy trên Windows 10/11\n\n"
-            f"❓ Cần hỗ trợ? → @BonBonxHPx"
-        )
-        
-        # Log download
-        log_row(user_id, username, "GET_TOOL_INFO", "0", f"Lấy thông tin Tool PC | Pass: {new_pass[:4]}***")
-        return
-
     # ===== HỆ THỐNG BOT =====
     if text == "🧩 Hệ Thống Bot":
         system_menu = {
@@ -5341,283 +5253,12 @@ def home():
     return f"Bot is running V6 | {pg_status} | {sheet_status}", 200
 
 # =========================================================
-# 🛠️ TOOL API — PC Tool đọc/ghi ví qua HTTP
-# Bảo vệ bằng header X-Tool-Key
+# Tool PC đã bị loại bỏ hoàn toàn.
 # =========================================================
-TOOL_API_KEY = os.getenv("TOOL_API_KEY", "").strip()
-TOOL_DEBUG_ENDPOINT_ENABLED = _env_bool("TOOL_DEBUG_ENDPOINT_ENABLED", False)
-
-def _tool_auth():
-    """Verify X-Tool-Key. Returns (True, None) hoặc (False, error_response)"""
-    if not TOOL_API_KEY:
-        return False, ({"ok": False, "error": "TOOL_API_KEY not configured on server"}, 500)
-    received = request.headers.get("X-Tool-Key", "").strip()
-    if received != TOOL_API_KEY:
-        print(
-            "[TOOL AUTH FAIL] "
-            f"path={request.path} ip={_extract_client_ip()} "
-            f"received_len={len(received)} expected_len={len(TOOL_API_KEY)}"
-        )
-        return False, ({"ok": False, "error": f"Unauthorized — server key {len(TOOL_API_KEY)}ch, received {len(received)}ch"}, 401)
-    return True, None
-
-@app.route("/tool/debug", methods=["GET"])
-def tool_debug():
-    """Temp debug — xem key server đang hold"""
-    if not TOOL_DEBUG_ENDPOINT_ENABLED:
-        return {"ok": False, "error": "Not Found"}, 404
-
-    ok, error = _tool_auth()
-    if not ok:
-        return error
-
-    k = TOOL_API_KEY
-    return {
-        "tool_api_key_len": len(k),
-        "tool_api_key_sha256_12": hashlib.sha256(k.encode("utf-8")).hexdigest()[:12] if k else ""
-    }, 200
-
-
-@app.route("/tool/vouchers", methods=["GET"])
-def tool_get_vouchers():
-    """
-    GET /tool/vouchers
-    → [{"source","code_name","code","price","status","promotion_id","signature"}, ...]
-    Không cần pass — voucher list là public.
-    """
-    auth_ok, auth_err = _tool_auth()
-    if not auth_ok:
-        return auth_err
-
-    rows = get_voucher_stock_cached()
-    if not rows:
-        return {"ok": True, "vouchers": []}, 200
-
-    # Lấy thongbao từ dòng đầu có giá trị
-    thongbao = ""
-    for row in rows:
-        def _get_tb(*keys):
-            for k in keys:
-                for rk in row:
-                    if str(rk).strip().lower() == k.lower():
-                        v = row[rk]
-                        return str(v).strip() if v is not None else ""
-            return ""
-        tb = _get_tb("thongbao")
-        if tb:
-            thongbao = tb
-            break
-
-    # Normalize header keys (get_all_records trả dict với key = header text)
-    items = []
-    for row in rows:
-        # Tìm các field linh hoạt giống tool cũ
-        def _get(*keys):
-            for k in keys:
-                for rk in row:
-                    if str(rk).strip().lower() == k.lower():
-                        v = row[rk]
-                        return str(v).strip() if v is not None else ""
-            return ""
-
-        code        = _get("code", "code_name", "voucher_code")
-        display     = _get("display_name", "display name", "ten_ma", "tên mã", "ten ma")
-        source      = _get("source", "nguon", "nguồn", "STT")
-        price_str   = _get("price", "cost", "gia", "giá")
-        status      = _get("status", "trang_thai", "trạng thái")
-        promo_id    = _get("promotion_id", "promotionid")
-        signature   = _get("signature", "chữ ký", "chu ky")
-
-        if not code:
-            continue
-
-        try:
-            price = int(price_str.replace(",", "")) if price_str else 1000
-        except (ValueError, TypeError):
-            price = 1000
-
-        try:
-            promo_id_int = int(promo_id) if promo_id else 0
-        except (ValueError, TypeError):
-            promo_id_int = 0
-
-        items.append({
-            "source":        source or "Sheet",
-            "code_name":     display or code,
-            "code":          code,
-            "price":         price,
-            "status":        status or "Sẵn sàng",
-            "promotion_id":  promo_id_int,
-            "signature":     signature
-        })
-
-    return {"ok": True, "vouchers": items, "thongbao": thongbao}, 200
-
-
-
-@app.route("/tool/wallet", methods=["GET"])
-def tool_get_wallet():
-    """
-    GET /tool/wallet?tele_id=123&pass=abc
-    → {"ok": true, "balance": 5000, "username": "xxx"}
-    """
-    auth_ok, auth_err = _tool_auth()
-    if not auth_ok:
-        return auth_err
-
-    tele_id  = request.args.get("tele_id", "").strip()
-    password = request.args.get("pass", "").strip()
-
-    if not tele_id:
-        return {"ok": False, "error": "tele_id required"}, 400
-    if PG_POOL is None:
-        return {"ok": False, "error": "DB not ready"}, 503
-
-    try:
-        tele_id = int(tele_id)
-    except ValueError:
-        return {"ok": False, "error": "tele_id must be numeric"}, 400
-
-    row = pg_exec(
-        "SELECT username, balance, status, pass FROM wallet WHERE tele_id=%s",
-        (tele_id,), fetchone=True
-    )
-    if not row:
-        return {"ok": False, "error": "User not found"}, 404
-
-    username, balance, status, stored_pass = row
-    status_lower = (status or "").strip().lower()
-
-    # Ban check
-    if status_lower in ("banned", "banned_qr_spam", "ban_1h"):
-        return {"ok": False, "error": "Account is banned"}, 403
-
-    # Password: nếu DB có pass → phải match. Chưa set pass → bỏ qua.
-    if stored_pass:
-        if password != stored_pass:
-            return {"ok": False, "error": "Wrong password"}, 401
-
-    dprint(f"🛠️ TOOL GET WALLET: tele_id={tele_id} balance={balance}")
-    return {"ok": True, "balance": int(balance or 0), "username": username or ""}, 200
-
-
-@app.route("/tool/deduct", methods=["POST"])
-def tool_deduct():
-    """
-    POST /tool/deduct  body: {"tele_id": 123, "pass": "abc", "amount": 5000}
-    → {"ok": true, "balance": 3000}
-    Atomic: WHERE balance >= amount → không race condition.
-    """
-    auth_ok, auth_err = _tool_auth()
-    if not auth_ok:
-        return auth_err
-
-    body     = request.get_json(silent=True) or {}
-    tele_id  = str(body.get("tele_id", "")).strip()
-    password = str(body.get("pass", "")).strip()
-    amount   = body.get("amount", 0)
-
-    if not tele_id:
-        return {"ok": False, "error": "tele_id required"}, 400
-    if not amount or int(amount) <= 0:
-        return {"ok": False, "error": "amount must be > 0"}, 400
-    if PG_POOL is None:
-        return {"ok": False, "error": "DB not ready"}, 503
-
-    try:
-        tele_id = int(tele_id)
-        amount  = int(amount)
-    except (ValueError, TypeError):
-        return {"ok": False, "error": "Invalid tele_id or amount"}, 400
-
-    # Read current state
-    row = pg_exec(
-        "SELECT balance, status, pass FROM wallet WHERE tele_id=%s",
-        (tele_id,), fetchone=True
-    )
-    if not row:
-        return {"ok": False, "error": "User not found"}, 404
-
-    balance, status, stored_pass = row
-    balance      = int(balance or 0)
-    status_lower = (status or "").strip().lower()
-
-    # Ban check
-    if status_lower in ("banned", "banned_qr_spam", "ban_1h"):
-        return {"ok": False, "error": "Account is banned"}, 403
-
-    # Password check
-    if stored_pass and password != stored_pass:
-        return {"ok": False, "error": "Wrong password"}, 401
-
-    # Balance check
-    if balance < amount:
-        return {"ok": False, "error": "Insufficient balance", "balance": balance}, 400
-
-    # Atomic deduct — WHERE balance >= amount chống race condition
-    result = pg_exec(
-        "UPDATE wallet SET balance = balance - %s, updated_at = NOW() "
-        "WHERE tele_id=%s AND balance >= %s RETURNING balance",
-        (amount, tele_id, amount), fetchone=True
-    )
-    if not result:
-        return {"ok": False, "error": "Deduct failed (concurrent request?)"}, 500
-
-    new_balance = int(result[0])
-
-    # Mirror Sheet (fire-and-forget)
-    if SHEET_READY:
-        try:
-            row_num = get_user_row(tele_id)
-            if row_num:
-                ws_money.update_cell(row_num, 3, str(new_balance))
-        except Exception:
-            pass
-
-    dprint(f"🛠️ TOOL DEDUCT: tele_id={tele_id} amount={amount} new_balance={new_balance}")
-    return {"ok": True, "balance": new_balance}, 200
-
-
-@app.route("/tool/log", methods=["POST"])
-def tool_log():
-    """
-    POST /tool/log
-    body: {"tele_id": 123, "username": "xxx", "voucher_name": "voucher100", "success": 2, "total": 2, "price": 2000, "balance_after": 96000}
-    → ghi 1 dòng vào Sheet Logs
-    """
-    auth_ok, auth_err = _tool_auth()
-    if not auth_ok:
-        return auth_err
-
-    body = request.get_json(silent=True) or {}
-    tele_id      = str(body.get("tele_id", ""))
-    username     = str(body.get("username", ""))
-    voucher_name = str(body.get("voucher_name", ""))
-    success      = int(body.get("success", 0))
-    total        = int(body.get("total", 0))
-    price        = int(body.get("price", 0))
-    balance_after= int(body.get("balance_after", 0))
-
-    if not SHEET_READY:
-        return {"ok": False, "error": "Sheet not ready"}, 503
-
-    try:
-        # Format: "Tool PC : Lưu voucher100 2/2 thành công"
-        note = f"Tool PC : Lưu {voucher_name} {success}/{total} thành công"
-
-        ws_log.append_row([
-            now_str(),
-            tele_id,
-            username,
-            "VOUCHER",
-            str(price),
-            note
-        ])
-        dprint(f"🛠️ TOOL LOG: {note} | tele_id={tele_id}")
-        return {"ok": True}, 200
-    except Exception as e:
-        dprint(f"🛠️ TOOL LOG error: {e}")
-        return {"ok": False, "error": str(e)}, 500
+@app.route("/tool/<path:_unused>", methods=["GET", "POST", "PUT", "PATCH", "DELETE"])
+@app.route("/tool", methods=["GET", "POST", "PUT", "PATCH", "DELETE"])
+def tool_removed(_unused=""):
+    return {"ok": False, "error": "Tool PC feature has been removed"}, 410
 
 
 # =========================================================
@@ -5629,7 +5270,7 @@ ensure_telegram_webhook()
 if __name__ == "__main__":
     print("=" * 60)
     print(" NgânMiu.Store Telegram Bot")
-    print(" V7 - PG PRIMARY | Ban→status | Pass Tool PC")
+    print(" V7 - PG PRIMARY | Ban→status")
     print("=" * 60)
     print("ADMIN_ID:", ADMIN_ID)
     print("SHEET_READY:", SHEET_READY)
