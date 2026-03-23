@@ -140,10 +140,9 @@ WEBHOOK_IP_PERMABAN_ENABLED = _env_bool("WEBHOOK_IP_PERMABAN_ENABLED", True)
 WEBHOOK_IP_STRIKE_LIMIT = max(10, _env_int("WEBHOOK_IP_STRIKE_LIMIT", 40))
 WEBHOOK_IP_STRIKE_WINDOW = max(10, _env_int("WEBHOOK_IP_STRIKE_WINDOW", 120))
 
-# TELEGRAM USER POLICY (VI ONLY + HARD BAN)
+# TELEGRAM USER POLICY (VI ONLY - NO LANGUAGE AUTO-BAN)
 SPAM_PERMANENT_ON_FIRST_HIT = _env_bool("SPAM_PERMANENT_ON_FIRST_HIT", True)
 TELEGRAM_VI_ONLY_ENFORCE = _env_bool("TELEGRAM_VI_ONLY_ENFORCE", True)
-TELEGRAM_VI_ONLY_BAN_NON_VI = _env_bool("TELEGRAM_VI_ONLY_BAN_NON_VI", True)
 TELEGRAM_VI_ALLOWED_LANGS = tuple(
     x.strip().lower()
     for x in (os.getenv("TELEGRAM_VI_ALLOWED_LANGS", "vi") or "vi").split(",")
@@ -169,7 +168,6 @@ print(
     "🛡️ User policy:"
     f" spam_perm_first={SPAM_PERMANENT_ON_FIRST_HIT}"
     f", vi_only={TELEGRAM_VI_ONLY_ENFORCE}"
-    f", ban_non_vi={TELEGRAM_VI_ONLY_BAN_NON_VI}"
     f", vi_langs={','.join(TELEGRAM_VI_ALLOWED_LANGS)}"
 )
 if BOT_SELF_ID:
@@ -2166,22 +2164,6 @@ def _notify_admin_ip_ban(ip: str, reason: str, count: int = 0):
     except Exception as e:
         dprint(f"notify admin ip ban error: {e}")
 
-def _notify_admin_policy_ban(user_id: int, username: str, reason: str):
-    if not ADMIN_ID or ADMIN_ID == 0:
-        return
-    try:
-        u = f"@{username}" if username else f"ID: {user_id}"
-        msg = (
-            "🚫 <b>POLICY BAN (VĨNH VIỄN)</b>\n\n"
-            f"👤 User: {u}\n"
-            f"📱 Tele ID: <code>{user_id}</code>\n"
-            f"🧾 Reason: <b>{reason}</b>\n"
-            f"🕒 Time: <b>{now_str()}</b>"
-        )
-        tg_send(ADMIN_ID, msg)
-    except Exception as e:
-        dprint(f"notify admin policy ban error: {e}")
-
 def _permaban_webhook_ip(ip: str, reason: str, count: int = 0) -> bool:
     ip = (ip or "").strip()
     if not ip or ip == "unknown" or not WEBHOOK_IP_PERMABAN_ENABLED:
@@ -4021,7 +4003,6 @@ def handle_update(update):
     if not user_id:
         return
 
-    username = from_user.get("username", "")
     is_bot_user = bool(from_user.get("is_bot"))
     if is_bot_user or (BOT_SELF_ID and int(user_id) == int(BOT_SELF_ID)):
         # Không áp policy/anti-spam cho bot account.
@@ -4033,14 +4014,6 @@ def handle_update(update):
             # language_code thiếu/unknown -> không auto-ban để tránh false-positive.
             dprint(f"vi-only skip unknown language: user={user_id}")
         elif not _is_vi_language_code(lang_code):
-            if TELEGRAM_VI_ONLY_BAN_NON_VI:
-                apply_ban(
-                    user_id,
-                    "PERMANENT",
-                    note_override=f"Ban vĩnh viễn: non-vi ({lang_code or 'unknown'})"
-                )
-                _notify_admin_policy_ban(user_id, username, f"non-vi ({lang_code or 'unknown'})")
-
             policy_chat_id = msg.get("chat", {}).get("id")
             if policy_chat_id:
                 tg_send(
