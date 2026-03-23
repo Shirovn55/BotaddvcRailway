@@ -92,6 +92,17 @@ def _env_bool(name, default=False):
         return bool(default)
     return str(raw).strip().lower() in ("1", "true", "yes", "on")
 
+def _extract_bot_self_id(bot_token: str) -> int:
+    token = (bot_token or "").strip()
+    if not token:
+        return 0
+    try:
+        return int(token.split(":", 1)[0])
+    except Exception:
+        return 0
+
+BOT_SELF_ID = _extract_bot_self_id(BOT_TOKEN)
+
 # Không để webhook trần khi deploy production.
 # Nếu chưa set env, tự sinh secret ổn định theo BOT_TOKEN.
 if not TELEGRAM_WEBHOOK_SECRET and BOT_TOKEN:
@@ -161,6 +172,8 @@ print(
     f", ban_non_vi={TELEGRAM_VI_ONLY_BAN_NON_VI}"
     f", vi_langs={','.join(TELEGRAM_VI_ALLOWED_LANGS)}"
 )
+if BOT_SELF_ID:
+    print(f"🤖 Bot self id detected: {BOT_SELF_ID}")
 
 # SEPAY
 SEPAY_WEBHOOK_SECRET = os.getenv("SEPAY_WEBHOOK_SECRET", "").strip()
@@ -609,6 +622,7 @@ while retry_count < MAX_RETRIES and not connected:
 # =========================================================
 print("🔄 Initializing PostgreSQL + Redis...")
 system_init_pg_redis()
+_unban_bot_self_if_needed()
 
 # =========================================================
 # 🔥 PRELOAD USERS + ROW CACHE (chạy 1 lần khi khởi động)
@@ -2216,6 +2230,29 @@ def _record_webhook_ip_strike(ip: str, reason: str):
     if limited:
         _permaban_webhook_ip(ip, reason, count)
 
+def _unban_bot_self_if_needed():
+    """Safety: nếu lỡ ban nhầm chính bot thì tự gỡ ban."""
+    if not BOT_SELF_ID or PG_POOL is None:
+        return
+    try:
+        r = pg_exec(
+            "SELECT status FROM wallet WHERE tele_id=%s",
+            (int(BOT_SELF_ID),),
+            fetchone=True
+        )
+        if not r:
+            return
+
+        status = (r[0] or "").strip().lower()
+        if status in ("banned", "ban_1h", "banned_qr_spam"):
+            pg_exec(
+                "UPDATE wallet SET status='active', notes=%s, updated_at=NOW() WHERE tele_id=%s",
+                ("auto-unban bot self", int(BOT_SELF_ID))
+            )
+            print(f"✅ Auto-unban BOT_SELF_ID={BOT_SELF_ID} (status cũ: {status})")
+    except Exception as e:
+        dprint(f"auto unban bot self error: {e}")
+
 def track_error(user_id, username="", reason=""):
     """
     ✅ Anti-spam (Redis ưu tiên)
@@ -2225,6 +2262,9 @@ def track_error(user_id, username="", reason=""):
         return False
 
     user_id = int(user_id)
+    if BOT_SELF_ID and user_id == int(BOT_SELF_ID):
+        dprint(f"skip track_error for BOT_SELF_ID={BOT_SELF_ID}")
+        return False
 
     # ✅ Redis mode (bền + scale)
     if RDS is not None:
@@ -2396,6 +2436,9 @@ def apply_ban(user_id, ban_type, note_override=""):
     - Sheet mirror: fire-and-forget
     """
     user_id = int(user_id)
+    if BOT_SELF_ID and user_id == int(BOT_SELF_ID):
+        dprint(f"⚠️ Skip ban BOT_SELF_ID={BOT_SELF_ID}")
+        return
     ensure_user_exists(user_id, username="")
 
     try:
@@ -3979,9 +4022,17 @@ def handle_update(update):
         return
 
     username = from_user.get("username", "")
+    is_bot_user = bool(from_user.get("is_bot"))
+    if is_bot_user or (BOT_SELF_ID and int(user_id) == int(BOT_SELF_ID)):
+        # Không áp policy/anti-spam cho bot account.
+        return
+
     if TELEGRAM_VI_ONLY_ENFORCE and int(user_id) != int(ADMIN_ID):
         lang_code = str(from_user.get("language_code", "") or "").strip().lower()
-        if not _is_vi_language_code(lang_code):
+        if not lang_code:
+            # language_code thiếu/unknown -> không auto-ban để tránh false-positive.
+            dprint(f"vi-only skip unknown language: user={user_id}")
+        elif not _is_vi_language_code(lang_code):
             if TELEGRAM_VI_ONLY_BAN_NON_VI:
                 apply_ban(
                     user_id,
