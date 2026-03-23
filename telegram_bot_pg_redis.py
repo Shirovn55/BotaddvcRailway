@@ -149,6 +149,8 @@ USER_CALLBACK_RATE_LIMIT = max(6, _env_int("USER_CALLBACK_RATE_LIMIT", 12))
 USER_CALLBACK_RATE_WINDOW = max(5, _env_int("USER_CALLBACK_RATE_WINDOW", 10))
 TELEGRAM_AUDIT_LOG = _env_bool("TELEGRAM_AUDIT_LOG", True)
 TELEGRAM_AUDIT_LOG_MAXLEN = max(32, _env_int("TELEGRAM_AUDIT_LOG_MAXLEN", 120))
+SPAM_SIGNAL_ALERT_COOLDOWN = max(60, _env_int("SPAM_SIGNAL_ALERT_COOLDOWN", 300))
+SPAM_EVENT_LOG_LIMIT = max(10, _env_int("SPAM_EVENT_LOG_LIMIT", 50))
 
 # WEBHOOK HARDENING
 WEBHOOK_MAX_BODY_BYTES = max(4096, _env_int("WEBHOOK_MAX_BODY_BYTES", 262144))
@@ -210,6 +212,7 @@ print(
     f" update_limit={USER_UPDATE_RATE_LIMIT}/{USER_UPDATE_RATE_WINDOW}s"
     f", update_ban={USER_UPDATE_BAN_TYPE}"
     f", audit_log={TELEGRAM_AUDIT_LOG}"
+    f", spam_signal_cd={SPAM_SIGNAL_ALERT_COOLDOWN}s"
     f" spam_perm_first={SPAM_PERMANENT_ON_FIRST_HIT}"
     f", vi_only={TELEGRAM_VI_ONLY_ENFORCE}"
     f", vi_langs={','.join(TELEGRAM_VI_ALLOWED_LANGS)}"
@@ -796,6 +799,10 @@ NOTICE_COOLDOWN_TRACKER = {}
 NOTICE_COOLDOWN_LOCK = threading.Lock()
 WEBHOOK_IP_BAN_LOCAL = set()
 WEBHOOK_IP_BAN_LOCK = threading.Lock()
+NEW_USER_MODERATION_LOCAL = False
+NEW_USER_MODERATION_LOCK = threading.Lock()
+SPAM_EVENT_LOG_LOCAL = deque(maxlen=SPAM_EVENT_LOG_LIMIT)
+SPAM_EVENT_LOG_LOCK = threading.Lock()
 
 # =========================================================
 # 🔥 ROW NUMBER CACHE - GIẢM 80% SHEET API CALLS
@@ -2372,6 +2379,12 @@ def _notify_admin_suspicious_webhook(ip, update_kind, count):
         return
 
     try:
+        _record_spam_event(
+            "SUSPICIOUS",
+            reason=f"Webhook nghi ngờ: {update_kind}",
+            detail=f"count={count}/{WEBHOOK_SUSPICIOUS_LIMIT} trong {WEBHOOK_SUSPICIOUS_WINDOW}s",
+            source_ip=ip,
+        )
         msg = (
             "⚠️ <b>WEBHOOK NGHI NGỜ</b>\n\n"
             f"🌐 IP Telegram: <code>{ip}</code>\n"
@@ -2529,6 +2542,16 @@ def _record_suspicious_webhook_event(client_ip, user_id, username, update_kind):
             f"⚠️ Suspicious webhook user={user_id} kind={update_kind} "
             f"count={count}/{WEBHOOK_SUSPICIOUS_LIMIT} window={WEBHOOK_SUSPICIOUS_WINDOW}s"
         )
+        if count >= max(2, WEBHOOK_SUSPICIOUS_LIMIT - 2):
+            _notify_admin_spam_signal(
+                "SUSPICIOUS_WEBHOOK_USER",
+                user_id=user_id,
+                username=username,
+                count=count,
+                window_sec=WEBHOOK_SUSPICIOUS_WINDOW,
+                source_ip=client_ip,
+                detail=f"{update_kind}"
+            )
         if limited:
             ban_type = _normalize_ban_type(WEBHOOK_SUSPICIOUS_USER_BAN_TYPE)
             note = (
@@ -2562,6 +2585,14 @@ def _record_suspicious_webhook_event(client_ip, user_id, username, update_kind):
         f"⚠️ Suspicious webhook ip={ip} kind={update_kind} "
         f"count={count}/{WEBHOOK_SUSPICIOUS_LIMIT} window={WEBHOOK_SUSPICIOUS_WINDOW}s"
     )
+    if count >= max(2, WEBHOOK_SUSPICIOUS_LIMIT - 2):
+        _notify_admin_spam_signal(
+            "SUSPICIOUS_WEBHOOK_IP",
+            count=count,
+            window_sec=WEBHOOK_SUSPICIOUS_WINDOW,
+            source_ip=ip,
+            detail=f"{update_kind}"
+        )
     if limited:
         _notify_admin_suspicious_webhook(ip, update_kind, count)
         return False
@@ -2673,6 +2704,142 @@ def _log_tg_event(event, update=None, reason="", extra=""):
         parts.append(extra_text)
 
     print(" ".join(parts))
+
+def _record_spam_event(event_type, user_id=0, username="", reason="", detail="", source_ip=""):
+    event = {
+        "time": now_str(),
+        "event": str(event_type or "UNKNOWN").strip().upper(),
+        "user_id": int(user_id or 0),
+        "username": str(username or "").strip(),
+        "reason": str(reason or "").strip(),
+        "detail": str(detail or "").strip(),
+        "source_ip": str(source_ip or "").strip(),
+    }
+
+    if RDS is not None:
+        try:
+            RDS.lpush("spam:events", json.dumps(event, ensure_ascii=False))
+            RDS.ltrim("spam:events", 0, SPAM_EVENT_LOG_LIMIT - 1)
+        except Exception as e:
+            dprint(f"spam event redis fallback: {e}")
+
+    with SPAM_EVENT_LOG_LOCK:
+        SPAM_EVENT_LOG_LOCAL.appendleft(event)
+
+def get_recent_spam_events(limit=10):
+    try:
+        limit = max(1, min(20, int(limit or 10)))
+    except Exception:
+        limit = 10
+
+    if RDS is not None:
+        try:
+            rows = RDS.lrange("spam:events", 0, limit - 1)
+            events = []
+            for row in rows:
+                try:
+                    events.append(json.loads(row))
+                except Exception:
+                    continue
+            if events:
+                return events
+        except Exception as e:
+            dprint(f"get_recent_spam_events redis fallback: {e}")
+
+    with SPAM_EVENT_LOG_LOCK:
+        return list(SPAM_EVENT_LOG_LOCAL)[:limit]
+
+def format_lastspam_text(events):
+    if not events:
+        return "📭 <b>Chưa có log spam gần đây.</b>"
+
+    lines = ["🚨 <b>SPAM GẦN NHẤT</b>"]
+    for idx, event in enumerate(events, 1):
+        user_id = int(event.get("user_id") or 0)
+        username = str(event.get("username") or "").strip()
+        user_text = f"<code>{user_id}</code>" if user_id else "<i>không rõ user</i>"
+        if username:
+            user_text += f" (@{username})"
+
+        source_ip = str(event.get("source_ip") or "").strip()
+        ip_text = f" | IP <code>{source_ip}</code>" if source_ip else ""
+        reason = _audit_text(event.get("reason", ""))
+        detail = _audit_text(event.get("detail", ""))
+
+        lines.append(
+            f"\n<b>{idx}.</b> [{event.get('time', '-')}] "
+            f"<b>{event.get('event', 'UNKNOWN')}</b>\n"
+            f"👤 {user_text}{ip_text}\n"
+            f"📌 {reason or '-'}"
+            + (f"\n📝 {detail}" if detail else "")
+        )
+
+    return "\n".join(lines)
+
+def _get_new_user_moderation():
+    if RDS is not None:
+        try:
+            return str(RDS.get("cfg:new_user_moderation") or "0").strip() == "1"
+        except Exception as e:
+            dprint(f"get moderation redis fallback: {e}")
+
+    with NEW_USER_MODERATION_LOCK:
+        return bool(NEW_USER_MODERATION_LOCAL)
+
+def _set_new_user_moderation(enabled):
+    enabled = bool(enabled)
+
+    if RDS is not None:
+        try:
+            RDS.set("cfg:new_user_moderation", "1" if enabled else "0")
+        except Exception as e:
+            dprint(f"set moderation redis fallback: {e}")
+
+    global NEW_USER_MODERATION_LOCAL
+    with NEW_USER_MODERATION_LOCK:
+        NEW_USER_MODERATION_LOCAL = enabled
+
+    return enabled
+
+def _notify_admin_spam_signal(signal_type, user_id=0, username="", count=0, window_sec=0, source_ip="", detail=""):
+    if not ADMIN_ID or ADMIN_ID == 0:
+        return False
+
+    key = str(user_id or source_ip or signal_type or "unknown")
+    cooldown_key = f"{signal_type}:{key}"
+    if not _cooldown_allows("spam_signal_alert", cooldown_key, SPAM_SIGNAL_ALERT_COOLDOWN):
+        return False
+
+    moderation_status = "BẬT" if _get_new_user_moderation() else "TẮT"
+    _record_spam_event(
+        "SIGNAL",
+        user_id=user_id,
+        username=username,
+        reason=signal_type,
+        detail=f"{detail} | count={count} | window={window_sec}s",
+        source_ip=source_ip,
+    )
+
+    user_info = f"<code>{int(user_id)}</code>" if user_id else "<i>không rõ user</i>"
+    if username:
+        user_info += f" (@{username})"
+    ip_text = f"\n🌐 IP: <code>{source_ip}</code>" if source_ip else ""
+    detail_text = f"\n📝 Chi tiết: {detail}" if detail else ""
+
+    try:
+        msg = (
+            "⚠️ <b>DẤU HIỆU SPAM</b>\n\n"
+            f"🚨 Loại: <b>{signal_type}</b>\n"
+            f"👤 User: {user_info}{ip_text}\n"
+            f"📊 Count: <b>{count}</b> trong <b>{int(window_sec or 0)}s</b>\n"
+            f"🛡️ Kiểm duyệt user mới: <b>{moderation_status}</b>"
+            f"{detail_text}"
+        )
+        tg_send(ADMIN_ID, msg)
+        return True
+    except Exception as e:
+        dprint(f"notify_admin_spam_signal error: {e}")
+        return False
 
 def _is_webhook_ip_banned(ip: str) -> bool:
     ip = (ip or "").strip()
@@ -2913,6 +3080,13 @@ def notify_admin_spam(user_id, username, ban_type, error_count, reason_label="Sp
         return
 
     try:
+        _record_spam_event(
+            "BAN",
+            user_id=user_id,
+            username=username,
+            reason=reason_label,
+            detail=f"{ban_type} | count={error_count} | window={window_sec}s",
+        )
         exists, balance, status = get_user_data(user_id)
 
         if ban_type == "PERMANENT":
@@ -3937,6 +4111,13 @@ def handle_active_gift_5k(user_id, username):
             "📞 Vui lòng liên hệ admin: @BonBonxHPx"
         )
 
+    if status == "new" and _get_new_user_moderation():
+        return False, (
+            "⏳ <b>Bot đang bật chế độ kiểm duyệt user mới.</b>\n\n"
+            "Tài khoản của bạn đang chờ admin duyệt trước khi kích hoạt.\n"
+            "📞 Liên hệ admin: @BonBonxHPx"
+        )
+
     try:
         new_balance = current_balance + ACTIVE_GIFT_AMOUNT
 
@@ -3992,6 +4173,14 @@ def handle_callback_query(cb):
         )
         if limited:
             tg_answer_callback(cb_id, "🚫 Bấm nhanh quá, chậm lại chút nhé", True)
+            _notify_admin_spam_signal(
+                "SPAM_CALLBACK_SIGNAL",
+                user_id=user_id,
+                username=username,
+                count=count,
+                window_sec=USER_CALLBACK_RATE_WINDOW,
+                detail=f"count={count}/{USER_CALLBACK_RATE_LIMIT}"
+            )
             track_error(user_id, username, "SPAM_CALLBACK")
             dprint(
                 f"🚫 Callback spam blocked: user={user_id} "
@@ -4638,6 +4827,14 @@ def handle_update(update):
             USER_COMMAND_RATE_WINDOW
         )
         if limited:
+            _notify_admin_spam_signal(
+                "SPAM_COMMAND_SIGNAL",
+                user_id=user_id,
+                username=username,
+                count=count,
+                window_sec=USER_COMMAND_RATE_WINDOW,
+                detail=f"count={count}/{USER_COMMAND_RATE_LIMIT}"
+            )
             track_error(user_id, username, "SPAM_COMMAND")
             dprint(
                 f"🚫 Command spam blocked: user={user_id} "
@@ -4652,6 +4849,14 @@ def handle_update(update):
             USER_TEXT_RATE_WINDOW
         )
         if limited:
+            _notify_admin_spam_signal(
+                "SPAM_TEXT_SIGNAL",
+                user_id=user_id,
+                username=username,
+                count=count,
+                window_sec=USER_TEXT_RATE_WINDOW,
+                detail=f"count={count}/{USER_TEXT_RATE_LIMIT}"
+            )
             track_error(user_id, username, "SPAM_TEXT")
             dprint(
                 f"🚫 Text spam blocked: user={user_id} "
@@ -4667,6 +4872,54 @@ def handle_update(update):
     # /stats - XEM CACHE STATS
     if text == "/stats":
         handle_stats_command(chat_id, user_id)
+        return
+
+    # /lastspam - XEM SPAM GẦN NHẤT
+    if text and text.startswith("/lastspam"):
+        if not _is_admin_context(user_id, chat_id):
+            _send_admin_denied(chat_id)
+            return
+
+        parts = text.split()
+        limit = 10
+        if len(parts) >= 2:
+            try:
+                limit = int(parts[1])
+            except Exception:
+                tg_send(chat_id, "❌ Số lượng log không hợp lệ. Ví dụ: <code>/lastspam 10</code>")
+                return
+
+        tg_send(chat_id, format_lastspam_text(get_recent_spam_events(limit)))
+        return
+
+    # /kiemduyet - BẬT CHẾ ĐỘ CHẶN USER MỚI KÍCH HOẠT
+    if text == "/kiemduyet":
+        if not _is_admin_context(user_id, chat_id):
+            _send_admin_denied(chat_id)
+            return
+
+        _set_new_user_moderation(True)
+        log_row(user_id, username, "NEW_USER_MODERATION", "ON", "Bật kiểm duyệt user mới")
+        tg_send(
+            chat_id,
+            "🛡️ <b>ĐÃ BẬT KIỂM DUYỆT USER MỚI</b>\n\n"
+            "User mới sẽ không thể kích hoạt nhận 5,100đ cho tới khi anh tắt chế độ này."
+        )
+        return
+
+    # /tatkiemduyet - TẮT CHẾ ĐỘ CHẶN USER MỚI KÍCH HOẠT
+    if text == "/tatkiemduyet":
+        if not _is_admin_context(user_id, chat_id):
+            _send_admin_denied(chat_id)
+            return
+
+        _set_new_user_moderation(False)
+        log_row(user_id, username, "NEW_USER_MODERATION", "OFF", "Tắt kiểm duyệt user mới")
+        tg_send(
+            chat_id,
+            "✅ <b>ĐÃ TẮT KIỂM DUYỆT USER MỚI</b>\n\n"
+            "User mới có thể kích hoạt nhận 5,100đ lại bình thường."
+        )
         return
 
     # /update
@@ -4951,6 +5204,7 @@ def handle_update(update):
 
         ensure_user_exists(user_id, username)
         exists, balance, status = get_user_data(user_id)
+        new_user_moderation = _get_new_user_moderation()
 
         # ✅ User chưa kích hoạt (status != 'active') → Hiển thị nút kích hoạt
         if status != "active":
@@ -4959,6 +5213,18 @@ def handle_update(update):
                     {"text": "🎁 Kích hoạt nhận 5,100đ", "callback_data": "activate_gift"}
                 ]]
             }
+
+            if status == "new" and new_user_moderation:
+                tg_send(
+                    chat_id,
+                    f"🛡️ <b>CHẾ ĐỘ KIỂM DUYỆT ĐANG BẬT</b>\n\n"
+                    f"👋 Xin chào <b>{username or 'bạn'}</b>\n"
+                    f"💼 Số dư hiện tại: <b>{balance:,}đ</b>\n"
+                    f"📊 Trạng thái: <b>Chờ admin duyệt</b>\n\n"
+                    "Hiện tại bot tạm khóa kích hoạt cho user mới.\n"
+                    "📞 Vui lòng chờ admin mở lại hoặc duyệt thủ công."
+                )
+                return
             
             if is_new_user:
                 # User mới
