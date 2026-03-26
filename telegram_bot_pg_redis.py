@@ -22,7 +22,7 @@ import unicodedata
 import requests
 import random  # ✅ THÊM RANDOM CHO CHECK VOUCHER
 from datetime import datetime, timedelta, timezone
-from flask import Flask, request
+from flask import Flask, g, request
 
 # =========================================================
 # PG + REDIS (Wallet DB + Anti-spam)
@@ -136,11 +136,18 @@ PG_POOL_ACQUIRE_SLEEP = max(0.01, _env_float("PG_POOL_ACQUIRE_SLEEP", 0.05))
 TELEGRAM_UPDATE_WORKERS = max(1, _env_int("TELEGRAM_UPDATE_WORKERS", 12))
 
 # WEBHOOK / UPDATE RATE LIMIT
-WEBHOOK_IP_RATE_LIMIT = max(30, _env_int("WEBHOOK_IP_RATE_LIMIT", 240))
-WEBHOOK_IP_RATE_WINDOW = max(10, _env_int("WEBHOOK_IP_RATE_WINDOW", 60))
+# Cho phép tune nhỏ qua ENV (không khóa cứng min quá cao)
+WEBHOOK_IP_RATE_LIMIT = max(1, _env_int("WEBHOOK_IP_RATE_LIMIT", 80))
+WEBHOOK_IP_RATE_WINDOW = max(1, _env_int("WEBHOOK_IP_RATE_WINDOW", 20))
 USER_UPDATE_RATE_LIMIT = max(1, _env_int("USER_UPDATE_RATE_LIMIT", 10))
 USER_UPDATE_RATE_WINDOW = max(10, _env_int("USER_UPDATE_RATE_WINDOW", 60))
 USER_UPDATE_BAN_TYPE = (os.getenv("USER_UPDATE_BAN_TYPE", "PERMANENT") or "PERMANENT").strip().upper()
+WEBHOOK_TRUST_PROXY_HEADERS = _env_bool("WEBHOOK_TRUST_PROXY_HEADERS", True)
+WEBHOOK_REQUIRE_CLOUDFLARE = _env_bool("WEBHOOK_REQUIRE_CLOUDFLARE", False)
+WEBHOOK_CLOUDFLARE_IP_ALLOWLIST = _env_cidr_list(
+    "WEBHOOK_CLOUDFLARE_IP_ALLOWLIST",
+    "",
+)
 USER_COMMAND_RATE_LIMIT = max(5, _env_int("USER_COMMAND_RATE_LIMIT", 8))
 USER_COMMAND_RATE_WINDOW = max(5, _env_int("USER_COMMAND_RATE_WINDOW", 20))
 USER_TEXT_RATE_LIMIT = max(8, _env_int("USER_TEXT_RATE_LIMIT", 15))
@@ -155,20 +162,23 @@ SPAM_EVENT_LOG_LIMIT = max(10, _env_int("SPAM_EVENT_LOG_LIMIT", 50))
 # WEBHOOK HARDENING
 WEBHOOK_MAX_BODY_BYTES = max(4096, _env_int("WEBHOOK_MAX_BODY_BYTES", 262144))
 TELEGRAM_WEBHOOK_PATH_TOKEN = os.getenv("TELEGRAM_WEBHOOK_PATH_TOKEN", "").strip()
+# Secure-by-default: bật path token nếu ENV không khai báo.
+TELEGRAM_WEBHOOK_USE_PATH_TOKEN = _env_bool("TELEGRAM_WEBHOOK_USE_PATH_TOKEN", True)
 WEBHOOK_INFLIGHT_LIMIT = max(
     TELEGRAM_UPDATE_WORKERS,
     _env_int("WEBHOOK_INFLIGHT_LIMIT", TELEGRAM_UPDATE_WORKERS * 6),
 )
-WEBHOOK_IP_PERMABAN_ENABLED = _env_bool("WEBHOOK_IP_PERMABAN_ENABLED", True)
-WEBHOOK_IP_STRIKE_LIMIT = max(10, _env_int("WEBHOOK_IP_STRIKE_LIMIT", 40))
-WEBHOOK_IP_STRIKE_WINDOW = max(10, _env_int("WEBHOOK_IP_STRIKE_WINDOW", 120))
+WEBHOOK_IP_PERMABAN_ENABLED = _env_bool("WEBHOOK_IP_PERMABAN_ENABLED", False)
+# Mặc định nới lỏng để tránh tự khóa quá tay khi bị scan domain.
+WEBHOOK_IP_STRIKE_LIMIT = max(1, _env_int("WEBHOOK_IP_STRIKE_LIMIT", 20))
+WEBHOOK_IP_STRIKE_WINDOW = max(10, _env_int("WEBHOOK_IP_STRIKE_WINDOW", 300))
 WEBHOOK_SUSPICIOUS_LIMIT = max(1, _env_int("WEBHOOK_SUSPICIOUS_LIMIT", 5))
 WEBHOOK_SUSPICIOUS_WINDOW = max(60, _env_int("WEBHOOK_SUSPICIOUS_WINDOW", 600))
 WEBHOOK_REJECT_LOG_COOLDOWN = max(10, _env_int("WEBHOOK_REJECT_LOG_COOLDOWN", 60))
 WEBHOOK_SUSPICIOUS_USER_BAN_TYPE = (
     os.getenv("WEBHOOK_SUSPICIOUS_USER_BAN_TYPE", "PERMANENT") or "PERMANENT"
 ).strip().upper()
-TELEGRAM_WEBHOOK_ENFORCE_IP_ALLOWLIST = _env_bool("TELEGRAM_WEBHOOK_ENFORCE_IP_ALLOWLIST", True)
+TELEGRAM_WEBHOOK_ENFORCE_IP_ALLOWLIST = _env_bool("TELEGRAM_WEBHOOK_ENFORCE_IP_ALLOWLIST", False)
 TELEGRAM_WEBHOOK_IP_ALLOWLIST = _env_cidr_list(
     "TELEGRAM_WEBHOOK_IP_ALLOWLIST",
     "149.154.160.0/20,91.108.4.0/22",
@@ -188,13 +198,17 @@ NON_VI_NOTICE_COOLDOWN = max(0, _env_int("NON_VI_NOTICE_COOLDOWN", 21600))
 BANNED_USER_NOTICE_COOLDOWN = max(0, _env_int("BANNED_USER_NOTICE_COOLDOWN", 3600))
 UNBAN_ALL_BLOCKED_USERS_ON_BOOT = _env_bool("UNBAN_ALL_BLOCKED_USERS_ON_BOOT", True)
 
-if not TELEGRAM_WEBHOOK_PATH_TOKEN:
-    print("⚠️ TELEGRAM_WEBHOOK_PATH_TOKEN chưa set -> webhook sẽ bị chặn (fail-closed).")
+if not TELEGRAM_WEBHOOK_USE_PATH_TOKEN:
+    print("⚠️ TELEGRAM_WEBHOOK_USE_PATH_TOKEN=0 -> webhook sẽ dùng /webhook (không khuyến nghị).")
+elif not TELEGRAM_WEBHOOK_PATH_TOKEN:
+    print("⚠️ TELEGRAM_WEBHOOK_USE_PATH_TOKEN=1 nhưng TELEGRAM_WEBHOOK_PATH_TOKEN trống -> webhook sẽ bị chặn.")
+if WEBHOOK_REQUIRE_CLOUDFLARE and not WEBHOOK_CLOUDFLARE_IP_ALLOWLIST:
+    print("⚠️ WEBHOOK_REQUIRE_CLOUDFLARE=1 nhưng WEBHOOK_CLOUDFLARE_IP_ALLOWLIST trống -> webhook sẽ bị chặn (fail-closed).")
 
 app.config["MAX_CONTENT_LENGTH"] = WEBHOOK_MAX_BODY_BYTES
 print(
     "🔐 Webhook hardening:"
-    f" path_token={'on' if TELEGRAM_WEBHOOK_PATH_TOKEN else 'off'}"
+    f" path_token={'on' if TELEGRAM_WEBHOOK_USE_PATH_TOKEN else 'off'}"
     f", strict_path={True}"
     f", strict_secret={True}"
     f", body_limit={WEBHOOK_MAX_BODY_BYTES}"
@@ -204,11 +218,18 @@ print(
     f", reject_log_cd={WEBHOOK_REJECT_LOG_COOLDOWN}s"
     f", suspicious_limit={WEBHOOK_SUSPICIOUS_LIMIT}/{WEBHOOK_SUSPICIOUS_WINDOW}s"
     f", suspicious_user_ban={WEBHOOK_SUSPICIOUS_USER_BAN_TYPE}"
+    f", trust_proxy_headers={WEBHOOK_TRUST_PROXY_HEADERS}"
+    f", require_cloudflare={WEBHOOK_REQUIRE_CLOUDFLARE}"
 )
 if TELEGRAM_WEBHOOK_ENFORCE_IP_ALLOWLIST:
     print(
         "🔐 Telegram webhook IP allowlist ranges:"
         f" {', '.join(str(x) for x in TELEGRAM_WEBHOOK_IP_ALLOWLIST) or '(none)'}"
+    )
+if WEBHOOK_REQUIRE_CLOUDFLARE:
+    print(
+        "🔐 Cloudflare edge allowlist ranges:"
+        f" {', '.join(str(x) for x in WEBHOOK_CLOUDFLARE_IP_ALLOWLIST) or '(none)'}"
     )
 print(
     "🛡️ User policy:"
@@ -332,7 +353,7 @@ def _safe_equals(a: str, b: str) -> bool:
     return bool(a) and bool(b) and hmac.compare_digest(str(a), str(b))
 
 def _build_webhook_path() -> str:
-    if TELEGRAM_WEBHOOK_PATH_TOKEN:
+    if TELEGRAM_WEBHOOK_USE_PATH_TOKEN and TELEGRAM_WEBHOOK_PATH_TOKEN:
         return f"/webhook/{TELEGRAM_WEBHOOK_PATH_TOKEN}"
     return "/webhook"
 
@@ -342,8 +363,35 @@ def _mask_webhook_url(url: str) -> str:
         return ""
     return re.sub(r"(/webhook/)[^/?#]+", r"\1<hidden>", text)
 
+def _sanitize_sensitive_log_text(value) -> str:
+    """
+    Che token nhạy cảm trước khi ghi log:
+    - /webhook/<path_token>
+    - BOT_TOKEN
+    - TELEGRAM_WEBHOOK_SECRET
+    - TELEGRAM_WEBHOOK_PATH_TOKEN
+    """
+    text = str(value or "")
+    if not text:
+        return ""
+
+    text = _mask_webhook_url(text)
+
+    if BOT_TOKEN:
+        text = text.replace(BOT_TOKEN, "<hidden-bot-token>")
+    if TELEGRAM_WEBHOOK_SECRET:
+        text = text.replace(TELEGRAM_WEBHOOK_SECRET, "<hidden-webhook-secret>")
+    if TELEGRAM_WEBHOOK_PATH_TOKEN:
+        text = text.replace(TELEGRAM_WEBHOOK_PATH_TOKEN, "<hidden-path-token>")
+
+    return text
+
 def _is_valid_webhook_path(path_token: str) -> bool:
     incoming = (path_token or "").strip()
+
+    # Chế độ không dùng path token: chỉ chấp nhận /webhook (không suffix)
+    if not TELEGRAM_WEBHOOK_USE_PATH_TOKEN:
+        return incoming == ""
 
     if not TELEGRAM_WEBHOOK_PATH_TOKEN:
         return False
@@ -354,7 +402,7 @@ def ensure_telegram_webhook(public_base_url_override: str = ""):
     if not BOT_TOKEN:
         print("⚠️ TELEGRAM_TOKEN trống -> không thể set Telegram webhook.")
         return False
-    if not TELEGRAM_WEBHOOK_PATH_TOKEN:
+    if TELEGRAM_WEBHOOK_USE_PATH_TOKEN and not TELEGRAM_WEBHOOK_PATH_TOKEN:
         print("⚠️ TELEGRAM_WEBHOOK_PATH_TOKEN trống -> bỏ qua set Telegram webhook.")
         return False
     if not TELEGRAM_WEBHOOK_SECRET:
@@ -391,13 +439,22 @@ def ensure_telegram_webhook(public_base_url_override: str = ""):
         print(f"🔗 Trying Telegram webhook via {source}: {_mask_webhook_url(webhook_url)}")
         try:
             resp = requests.post(f"{BASE_URL}/setWebhook", json=payload, timeout=20)
-            data = resp.json()
+            try:
+                data = resp.json()
+            except Exception:
+                data = {"raw": (resp.text or "")[:500]}
             if resp.ok and data.get("ok"):
                 print(f"✅ Telegram webhook active via {source}: {_mask_webhook_url(webhook_url)}")
                 return True
-            print(f"⚠️ setWebhook failed via {source}: status={resp.status_code} body={data}")
+            safe_body = _sanitize_sensitive_log_text(json.dumps(data, ensure_ascii=False))
+            print(
+                f"⚠️ setWebhook failed via {source}:"
+                f" status={resp.status_code}"
+                f" webhook={_mask_webhook_url(webhook_url)}"
+                f" body={safe_body}"
+            )
         except Exception as e:
-            print(f"⚠️ setWebhook error via {source}: {e}")
+            print(f"⚠️ setWebhook error via {source}: {_sanitize_sensitive_log_text(e)}")
 
     return False
 
@@ -2279,23 +2336,71 @@ def _to_valid_ip(ip_text: str) -> str:
         return ""
 
 def _extract_client_ip():
-    xff_raw = (request.headers.get("X-Forwarded-For", "") or "").strip()
-    if xff_raw:
-        # Duyệt từ phải qua trái để giảm nguy cơ spoof XFF ở vị trí đầu.
-        for piece in reversed([x.strip() for x in xff_raw.split(",") if x.strip()]):
-            normalized = _to_valid_ip(piece)
-            if normalized:
-                return normalized
+    remote_ip = _to_valid_ip(request.remote_addr or "")
+    if not WEBHOOK_TRUST_PROXY_HEADERS:
+        if remote_ip:
+            return remote_ip
+
+        fp_seed = "|".join([
+            str(request.remote_addr or "").strip(),
+            (request.headers.get("User-Agent", "") or "").strip(),
+        ])
+        if fp_seed:
+            return "fp:" + hashlib.sha256(fp_seed.encode("utf-8")).hexdigest()[:20]
+        return "unknown"
+
+    if WEBHOOK_REQUIRE_CLOUDFLARE:
+        cf_ip = _to_valid_ip(request.headers.get("CF-Connecting-IP", "") or "")
+        if cf_ip:
+            return cf_ip
 
     real_ip = _to_valid_ip(request.headers.get("X-Real-IP", "") or "")
     if real_ip:
         return real_ip
 
-    remote_ip = _to_valid_ip(request.remote_addr or "")
+    xff_raw = (request.headers.get("X-Forwarded-For", "") or "").strip()
+    if xff_raw:
+        # Duyệt từ phải qua trái để giảm nguy cơ spoof XFF ở vị trí đầu.
+        pieces = [x.strip() for x in xff_raw.split(",") if x.strip()]
+        if len(pieces) > 20:
+            pieces = pieces[-20:]
+        for piece in reversed(pieces):
+            normalized = _to_valid_ip(piece)
+            if normalized:
+                return normalized
+
     if remote_ip:
         return remote_ip
 
+    # Fallback: vẫn tạo fingerprint ổn định để áp strike/ban/rate-limit được.
+    fp_seed = "|".join([
+        (request.headers.get("X-Forwarded-For", "") or "").strip(),
+        (request.headers.get("X-Real-IP", "") or "").strip(),
+        str(request.remote_addr or "").strip(),
+        (request.headers.get("User-Agent", "") or "").strip(),
+    ])
+    if fp_seed:
+        return "fp:" + hashlib.sha256(fp_seed.encode("utf-8")).hexdigest()[:20]
     return "unknown"
+
+def _is_webhook_request_path(path: str) -> bool:
+    p = str(path or "").strip()
+    return p == "/webhook" or p.startswith("/webhook/")
+
+def _get_request_client_ip() -> str:
+    try:
+        cached = getattr(g, "_client_ip_cache", "")
+        if cached:
+            return str(cached)
+    except Exception:
+        pass
+
+    ip = _extract_client_ip()
+    try:
+        g._client_ip_cache = ip
+    except Exception:
+        pass
+    return ip
 
 def _is_telegram_webhook_ip_allowed(ip: str) -> bool:
     if not TELEGRAM_WEBHOOK_ENFORCE_IP_ALLOWLIST:
@@ -2313,6 +2418,29 @@ def _is_telegram_webhook_ip_allowed(ip: str) -> bool:
         return False
 
     for net in TELEGRAM_WEBHOOK_IP_ALLOWLIST:
+        try:
+            if ip_obj.version == net.version and ip_obj in net:
+                return True
+        except Exception:
+            continue
+    return False
+
+def _is_cloudflare_edge_ip_allowed(ip: str) -> bool:
+    if not WEBHOOK_REQUIRE_CLOUDFLARE:
+        return True
+    if not WEBHOOK_CLOUDFLARE_IP_ALLOWLIST:
+        return False
+
+    normalized = _to_valid_ip(ip)
+    if not normalized:
+        return False
+
+    try:
+        ip_obj = ipaddress.ip_address(normalized)
+    except Exception:
+        return False
+
+    for net in WEBHOOK_CLOUDFLARE_IP_ALLOWLIST:
         try:
             if ip_obj.version == net.version and ip_obj in net:
                 return True
@@ -2903,7 +3031,7 @@ def _notify_admin_spam_signal(signal_type, user_id=0, username="", count=0, wind
 
 def _is_webhook_ip_banned(ip: str) -> bool:
     ip = (ip or "").strip()
-    if not ip or ip == "unknown":
+    if not ip:
         return False
 
     if RDS is not None:
@@ -2932,7 +3060,7 @@ def _notify_admin_ip_ban(ip: str, reason: str, count: int = 0):
 
 def _permaban_webhook_ip(ip: str, reason: str, count: int = 0) -> bool:
     ip = (ip or "").strip()
-    if not ip or ip == "unknown" or not WEBHOOK_IP_PERMABAN_ENABLED:
+    if not ip or not WEBHOOK_IP_PERMABAN_ENABLED:
         return False
 
     newly_banned = False
@@ -2965,7 +3093,7 @@ def _record_webhook_ip_strike(ip: str, reason: str):
     if not WEBHOOK_IP_PERMABAN_ENABLED:
         return
     ip = (ip or "").strip()
-    if not ip or ip == "unknown":
+    if not ip:
         return
 
     limited, count = _rate_limit_exceeded(
@@ -6050,6 +6178,53 @@ UPDATE_EXECUTOR = ThreadPoolExecutor(
 )
 WEBHOOK_INFLIGHT_SEM = threading.BoundedSemaphore(WEBHOOK_INFLIGHT_LIMIT)
 
+@app.before_request
+def _precheck_telegram_webhook_ip():
+    """
+    Chặn IP sớm ở lớp global request hook cho /webhook*.
+    Mục tiêu: loại request không hợp lệ trước khi vào view handler.
+    """
+    path = request.path or ""
+    if not _is_webhook_request_path(path):
+        return None
+
+    if request.method != "POST":
+        return None
+
+    edge_ip = _to_valid_ip(request.remote_addr or "")
+    if not _is_cloudflare_edge_ip_allowed(edge_ip):
+        dprint(
+            "🚫 Webhook blocked before Telegram checks: "
+            f"origin={edge_ip or 'unknown'} require_cloudflare={WEBHOOK_REQUIRE_CLOUDFLARE}"
+        )
+        return "forbidden", 403
+
+    client_ip = _get_request_client_ip()
+
+    if _is_webhook_ip_banned(client_ip):
+        return "forbidden", 403
+
+    if len(path) > 256:
+        _record_webhook_ip_strike(client_ip, "path_too_long")
+        return "Not Found", 404
+
+    if not _is_telegram_webhook_ip_allowed(client_ip):
+        suffix = ""
+        if path.startswith("/webhook/"):
+            suffix = path[len("/webhook/"):]
+
+        path_ok = _is_valid_webhook_path(suffix)
+        if TELEGRAM_WEBHOOK_USE_PATH_TOKEN and path_ok:
+            _permaban_webhook_ip(client_ip, "path_token_leak_probe", 1)
+        elif (not TELEGRAM_WEBHOOK_USE_PATH_TOKEN) and path.startswith("/webhook/"):
+            _permaban_webhook_ip(client_ip, "invalid_path_no_token_mode", 1)
+            _record_webhook_ip_strike(client_ip, "invalid_path_no_token_mode")
+        else:
+            _record_webhook_ip_strike(client_ip, "ip_not_allowed")
+        return "forbidden", 403
+
+    return None
+
 def _safe_handle_update(update):
     try:
         handle_update(update)
@@ -6062,14 +6237,32 @@ def _safe_handle_update(update):
         except Exception:
             pass
 
-@app.route("/webhook/<path_token>", methods=["POST"])
-@app.route("/webhook", methods=["POST"])
 def webhook(path_token=""):
+    """
+    Telegram webhook handler (fail-safe):
+    - Luôn fail-closed khi request bất thường
+    - Không để exception làm rơi 5xx
+    """
+    try:
+        return _webhook_impl(path_token)
+    except Exception as e:
+        try:
+            dprint(f"webhook fatal error: {e}")
+            dprint(traceback.format_exc())
+        except Exception:
+            pass
+        try:
+            _record_webhook_ip_strike(_get_request_client_ip(), "webhook_exception")
+        except Exception:
+            pass
+        return "forbidden", 403
+
+def _webhook_impl(path_token=""):
     early_reject = _early_reject_telegram_webhook(path_token)
     if early_reject is not None:
         return early_reject
 
-    client_ip = _extract_client_ip()
+    client_ip = _get_request_client_ip()
 
     if _is_webhook_ip_banned(client_ip):
         _note_webhook_reject("ip_banned")
@@ -6151,6 +6344,39 @@ def webhook(path_token=""):
         return "server busy", 503
 
     return "ok"
+
+def _webhook_invalid_path(invalid_path=""):
+    """
+    Trap route cho /webhook/<anything> khi đang chạy chế độ không dùng path token.
+    Mục tiêu: ghi strike/ban nhanh để giảm spam lặp.
+    """
+    client_ip = _get_request_client_ip()
+
+    # Nếu rơi vào allowlist thì không ban ngay, chỉ strike để tránh false-positive.
+    _record_webhook_ip_strike(client_ip, "invalid_path_allowlisted")
+    return "Not Found", 404
+
+# Chỉ đăng ký route có path token khi bật explicit.
+if TELEGRAM_WEBHOOK_USE_PATH_TOKEN:
+    app.add_url_rule(
+        "/webhook/<path_token>",
+        endpoint="telegram_webhook_with_token",
+        view_func=webhook,
+        methods=["POST"],
+    )
+else:
+    app.add_url_rule(
+        "/webhook/<path:invalid_path>",
+        endpoint="telegram_webhook_invalid_path",
+        view_func=_webhook_invalid_path,
+        methods=["POST"],
+    )
+app.add_url_rule(
+    "/webhook",
+    endpoint="telegram_webhook",
+    view_func=webhook,
+    methods=["POST"],
+)
 
 @app.route("/", methods=["GET"])
 def home():
