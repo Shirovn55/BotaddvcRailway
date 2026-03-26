@@ -164,6 +164,7 @@ WEBHOOK_IP_STRIKE_LIMIT = max(10, _env_int("WEBHOOK_IP_STRIKE_LIMIT", 40))
 WEBHOOK_IP_STRIKE_WINDOW = max(10, _env_int("WEBHOOK_IP_STRIKE_WINDOW", 120))
 WEBHOOK_SUSPICIOUS_LIMIT = max(1, _env_int("WEBHOOK_SUSPICIOUS_LIMIT", 5))
 WEBHOOK_SUSPICIOUS_WINDOW = max(60, _env_int("WEBHOOK_SUSPICIOUS_WINDOW", 600))
+WEBHOOK_REJECT_LOG_COOLDOWN = max(10, _env_int("WEBHOOK_REJECT_LOG_COOLDOWN", 60))
 WEBHOOK_SUSPICIOUS_USER_BAN_TYPE = (
     os.getenv("WEBHOOK_SUSPICIOUS_USER_BAN_TYPE", "PERMANENT") or "PERMANENT"
 ).strip().upper()
@@ -200,6 +201,7 @@ print(
     f", inflight_limit={WEBHOOK_INFLIGHT_LIMIT}"
     f", ip_permaban={WEBHOOK_IP_PERMABAN_ENABLED}"
     f", ip_allowlist={TELEGRAM_WEBHOOK_ENFORCE_IP_ALLOWLIST}"
+    f", reject_log_cd={WEBHOOK_REJECT_LOG_COOLDOWN}s"
     f", suspicious_limit={WEBHOOK_SUSPICIOUS_LIMIT}/{WEBHOOK_SUSPICIOUS_WINDOW}s"
     f", suspicious_user_ban={WEBHOOK_SUSPICIOUS_USER_BAN_TYPE}"
 )
@@ -799,6 +801,8 @@ RATE_LIMIT_TRACKER = {}
 RATE_LIMIT_LOCK = threading.Lock()
 NOTICE_COOLDOWN_TRACKER = {}
 NOTICE_COOLDOWN_LOCK = threading.Lock()
+WEBHOOK_REJECT_STATS_LOCAL = {}
+WEBHOOK_REJECT_LOCK = threading.Lock()
 WEBHOOK_IP_BAN_LOCAL = set()
 WEBHOOK_IP_BAN_LOCK = threading.Lock()
 NEW_USER_MODERATION_LOCAL = False
@@ -2315,6 +2319,60 @@ def _is_telegram_webhook_ip_allowed(ip: str) -> bool:
         except Exception:
             continue
     return False
+
+def _note_webhook_reject(reason: str):
+    cooldown_sec = max(0, int(WEBHOOK_REJECT_LOG_COOLDOWN or 0))
+    if cooldown_sec <= 0:
+        return
+
+    tag = str(reason or "unknown").strip().lower() or "unknown"
+    now = time.time()
+    should_log = False
+    burst_count = 0
+
+    with WEBHOOK_REJECT_LOCK:
+        entry = WEBHOOK_REJECT_STATS_LOCAL.get(tag)
+        if entry is None:
+            entry = {"last_log": 0.0, "suppressed": 0}
+            WEBHOOK_REJECT_STATS_LOCAL[tag] = entry
+
+        last_log = float(entry.get("last_log", 0.0) or 0.0)
+        if now - last_log >= cooldown_sec:
+            should_log = True
+            burst_count = int(entry.get("suppressed", 0) or 0) + 1
+            entry["last_log"] = now
+            entry["suppressed"] = 0
+        else:
+            entry["suppressed"] = int(entry.get("suppressed", 0) or 0) + 1
+
+    if should_log:
+        dprint(f"⚠️ Webhook reject[{tag}] x{burst_count} in ~{cooldown_sec}s")
+
+def _early_reject_telegram_webhook(path_token: str = ""):
+    # Giữ các check này ở đầu webhook để request rác bị cắt trước mọi logic nặng hơn.
+    if not _is_valid_webhook_path(path_token):
+        _note_webhook_reject("invalid_path")
+        return "Not Found", 404
+
+    if not TELEGRAM_WEBHOOK_SECRET:
+        _note_webhook_reject("server_misconfigured")
+        return "server misconfigured", 503
+
+    recv_secret = (request.headers.get("X-Telegram-Bot-Api-Secret-Token", "") or "").strip()
+    if not _safe_equals(recv_secret, TELEGRAM_WEBHOOK_SECRET):
+        _note_webhook_reject("invalid_secret")
+        return "forbidden", 403
+
+    content_len = request.content_length
+    if content_len is not None:
+        if content_len <= 0:
+            _note_webhook_reject("empty_body")
+            return "bad request", 400
+        if content_len > WEBHOOK_MAX_BODY_BYTES:
+            _note_webhook_reject("body_too_large")
+            return "payload too large", 413
+
+    return None
 
 def _is_admin_user(user_id) -> bool:
     try:
@@ -6007,27 +6065,19 @@ def _safe_handle_update(update):
 @app.route("/webhook/<path_token>", methods=["POST"])
 @app.route("/webhook", methods=["POST"])
 def webhook(path_token=""):
+    early_reject = _early_reject_telegram_webhook(path_token)
+    if early_reject is not None:
+        return early_reject
+
     client_ip = _extract_client_ip()
 
     if _is_webhook_ip_banned(client_ip):
+        _note_webhook_reject("ip_banned")
         return "forbidden", 403
 
     if not _is_telegram_webhook_ip_allowed(client_ip):
-        _record_webhook_ip_strike(client_ip, "ip_not_allowed")
+        _note_webhook_reject("ip_not_allowed")
         return "forbidden", 403
-
-    if not _is_valid_webhook_path(path_token):
-        _record_webhook_ip_strike(client_ip, "invalid_path")
-        return "Not Found", 404
-
-    if not TELEGRAM_WEBHOOK_SECRET:
-        return "server misconfigured", 503
-
-    recv_secret = (request.headers.get("X-Telegram-Bot-Api-Secret-Token", "") or "").strip()
-    has_valid_secret = _safe_equals(recv_secret, TELEGRAM_WEBHOOK_SECRET)
-    if not has_valid_secret:
-        _record_webhook_ip_strike(client_ip, "invalid_secret")
-        return "Unauthorized", 401
 
     limited, count = _rate_limit_exceeded(
         "webhook_ip",
@@ -6040,6 +6090,7 @@ def webhook(path_token=""):
             f"🚫 Webhook IP limited: ip={client_ip} "
             f"count={count}/{WEBHOOK_IP_RATE_LIMIT} window={WEBHOOK_IP_RATE_WINDOW}s"
         )
+        _note_webhook_reject("ip_rate_limited")
         return "too many requests", 429
 
     content_len = request.content_length or 0
