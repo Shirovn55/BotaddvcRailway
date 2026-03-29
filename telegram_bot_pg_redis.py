@@ -2448,7 +2448,7 @@ def _is_cloudflare_edge_ip_allowed(ip: str) -> bool:
             continue
     return False
 
-def _note_webhook_reject(reason: str):
+def _note_webhook_reject(reason: str, extra: str = ""):
     cooldown_sec = max(0, int(WEBHOOK_REJECT_LOG_COOLDOWN or 0))
     if cooldown_sec <= 0:
         return
@@ -2474,7 +2474,22 @@ def _note_webhook_reject(reason: str):
             entry["suppressed"] = int(entry.get("suppressed", 0) or 0) + 1
 
     if should_log:
-        dprint(f"⚠️ Webhook reject[{tag}] x{burst_count} in ~{cooldown_sec}s")
+        method = "-"
+        path = "-"
+        client_ip = "unknown"
+        extra_text = str(extra or "").strip()
+        try:
+            method = (request.method or "-").strip() or "-"
+            path = _mask_webhook_url((request.path or "").strip() or "-")
+            client_ip = (_get_request_client_ip() or "").strip() or "unknown"
+        except Exception:
+            pass
+
+        suffix = f" {extra_text}" if extra_text else ""
+        print(
+            f"⚠️ WEBHOOK_REJECT reason={tag} burst={burst_count} "
+            f"window~{cooldown_sec}s method={method} path={path} ip={client_ip}{suffix}"
+        )
 
 def _early_reject_telegram_webhook(path_token: str = ""):
     # Giữ các check này ở đầu webhook để request rác bị cắt trước mọi logic nặng hơn.
@@ -6193,19 +6208,21 @@ def _precheck_telegram_webhook_ip():
 
     edge_ip = _to_valid_ip(request.remote_addr or "")
     if not _is_cloudflare_edge_ip_allowed(edge_ip):
-        dprint(
-            "🚫 Webhook blocked before Telegram checks: "
-            f"origin={edge_ip or 'unknown'} require_cloudflare={WEBHOOK_REQUIRE_CLOUDFLARE}"
+        _note_webhook_reject(
+            "cloudflare_edge_not_allowed",
+            f"origin={edge_ip or 'unknown'} require_cloudflare={WEBHOOK_REQUIRE_CLOUDFLARE}",
         )
         return "forbidden", 403
 
     client_ip = _get_request_client_ip()
 
     if _is_webhook_ip_banned(client_ip):
+        _note_webhook_reject("ip_banned_precheck")
         return "forbidden", 403
 
     if len(path) > 256:
         _record_webhook_ip_strike(client_ip, "path_too_long")
+        _note_webhook_reject("path_too_long")
         return "Not Found", 404
 
     if not _is_telegram_webhook_ip_allowed(client_ip):
@@ -6216,11 +6233,14 @@ def _precheck_telegram_webhook_ip():
         path_ok = _is_valid_webhook_path(suffix)
         if TELEGRAM_WEBHOOK_USE_PATH_TOKEN and path_ok:
             _permaban_webhook_ip(client_ip, "path_token_leak_probe", 1)
+            _note_webhook_reject("path_token_leak_probe")
         elif (not TELEGRAM_WEBHOOK_USE_PATH_TOKEN) and path.startswith("/webhook/"):
             _permaban_webhook_ip(client_ip, "invalid_path_no_token_mode", 1)
             _record_webhook_ip_strike(client_ip, "invalid_path_no_token_mode")
+            _note_webhook_reject("invalid_path_no_token_mode")
         else:
             _record_webhook_ip_strike(client_ip, "ip_not_allowed")
+            _note_webhook_reject("ip_not_allowed_precheck")
         return "forbidden", 403
 
     return None
