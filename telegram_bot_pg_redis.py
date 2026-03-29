@@ -4432,6 +4432,7 @@ def handle_callback_query(cb):
     user_id = from_user.get("id")
     username = from_user.get("username", "")
     chat_id = cb.get("message", {}).get("chat", {}).get("id")
+    cb_msg_id = cb.get("message", {}).get("message_id")
 
     if user_id:
         limited, count = _rate_limit_exceeded(
@@ -4706,6 +4707,16 @@ def handle_callback_query(cb):
         action = data.split(":")[1]
         
         if action == "bot_list":
+            bot_list_text = (
+                "📱 <b>DANH SÁCH BOT NGÂNMIU</b>\n\n"
+                "🤖 Hệ sinh thái bot của chúng tôi:\n\n"
+                "🔴 <b>Bot Lưu Voucher</b>\n"
+                "└ Lưu voucher Shopee tự động\n\n"
+                "📦 <b>Bot Check Đơn Hàng</b>\n"
+                "└ Kiểm tra trạng thái đơn hàng\n\n"
+                "📲 <b>Bot Thuê Số</b> (Sắp ra mắt)\n"
+                "└ Thuê số điện thoại nhận OTP"
+            )
             bot_list_menu = {
                 "inline_keyboard": [
                     [{"text": "🔴 Bot Lưu Voucher", "url": "https://t.me/nganmiu_bot"}],
@@ -4716,19 +4727,10 @@ def handle_callback_query(cb):
             }
             
             tg_answer_callback(cb_id)
-            tg_edit_message(
-                chat_id,
-                cb_msg_id,
-                "📱 <b>DANH SÁCH BOT NGÂNMIU</b>\n\n"
-                "🤖 Hệ sinh thái bot của chúng tôi:\n\n"
-                "🔴 <b>Bot Lưu Voucher</b>\n"
-                "└ Lưu voucher Shopee tự động\n\n"
-                "📦 <b>Bot Check Đơn Hàng</b>\n"
-                "└ Kiểm tra trạng thái đơn hàng\n\n"
-                "📲 <b>Bot Thuê Số</b> (Sắp ra mắt)\n"
-                "└ Thuê số điện thoại nhận OTP",
-                bot_list_menu
-            )
+            if cb_msg_id:
+                tg_edit_message(chat_id, cb_msg_id, bot_list_text, bot_list_menu)
+            elif chat_id:
+                tg_send(chat_id, bot_list_text, bot_list_menu)
             return
         
         if action == "coming_soon":
@@ -4736,6 +4738,11 @@ def handle_callback_query(cb):
             return
         
         if action == "back":
+            system_text = (
+                "🏠 <b>HỆ THỐNG BOT NGÂNMIU</b>\n\n"
+                "👋 Chào mừng bạn đến với hệ sinh thái bot NgânMiu!\n\n"
+                "📌 <b>Chọn một trong các dịch vụ bên dưới:</b>"
+            )
             system_menu = {
                 "inline_keyboard": [
                     [{"text": "👤 Admin hỗ trợ", "url": "https://t.me/BonBonxHPx"}],
@@ -4748,14 +4755,10 @@ def handle_callback_query(cb):
             }
             
             tg_answer_callback(cb_id)
-            tg_edit_message(
-                chat_id,
-                cb_msg_id,
-                "🏠 <b>HỆ THỐNG BOT NGÂNMIU</b>\n\n"
-                "👋 Chào mừng bạn đến với hệ sinh thái bot NgânMiu!\n\n"
-                "📌 <b>Chọn một trong các dịch vụ bên dưới:</b>",
-                system_menu
-            )
+            if cb_msg_id:
+                tg_edit_message(chat_id, cb_msg_id, system_text, system_menu)
+            elif chat_id:
+                tg_send(chat_id, system_text, system_menu)
             return
 
     tg_answer_callback(cb_id, "⚠️ Thao tác không hỗ trợ", True)
