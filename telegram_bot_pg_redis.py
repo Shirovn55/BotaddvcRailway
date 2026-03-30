@@ -225,6 +225,8 @@ NON_VI_AUTO_BAN = False
 NON_VI_NOTICE_COOLDOWN = max(0, _env_int("NON_VI_NOTICE_COOLDOWN", 21600))
 BANNED_USER_NOTICE_COOLDOWN = max(0, _env_int("BANNED_USER_NOTICE_COOLDOWN", 3600))
 UNBAN_ALL_BLOCKED_USERS_ON_BOOT = _env_bool("UNBAN_ALL_BLOCKED_USERS_ON_BOOT", True)
+# Mirror ví tiền ra Google Sheet để bạn theo dõi (không bắt buộc)
+SHEET_MIRROR_WALLET = os.getenv("SHEET_MIRROR_WALLET", "1").strip() in ("1","true","True","YES","yes")
 
 if not TELEGRAM_WEBHOOK_USE_PATH_TOKEN:
     print("⚠️ TELEGRAM_WEBHOOK_USE_PATH_TOKEN=0 -> webhook sẽ dùng /webhook (không khuyến nghị).")
@@ -291,9 +293,6 @@ SEPAY_BANK = os.getenv("SEPAY_BANK", "VietinBank").strip()
 SEPAY_QR_TEMPLATE = os.getenv("SEPAY_QR_TEMPLATE", "compact").strip()
 SEPAY_QR_DESC_PREFIX = os.getenv("SEPAY_QR_DESC_PREFIX", "SEVQR NAP").strip()
 SEPAY_QR_BASE = os.getenv("SEPAY_QR_BASE", "https://qr.sepay.vn").strip()
-
-# Mirror ví tiền ra Google Sheet để bạn theo dõi (không bắt buộc)
-SHEET_MIRROR_WALLET = os.getenv("SHEET_MIRROR_WALLET", "1").strip() in ("1","true","True","YES","yes")
 
 
 BASE_URL = f"https://api.telegram.org/bot{BOT_TOKEN}"
