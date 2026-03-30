@@ -182,6 +182,11 @@ USER_TEXT_RATE_LIMIT = max(8, _env_int("USER_TEXT_RATE_LIMIT", 15))
 USER_TEXT_RATE_WINDOW = max(5, _env_int("USER_TEXT_RATE_WINDOW", 20))
 USER_CALLBACK_RATE_LIMIT = max(6, _env_int("USER_CALLBACK_RATE_LIMIT", 12))
 USER_CALLBACK_RATE_WINDOW = max(5, _env_int("USER_CALLBACK_RATE_WINDOW", 10))
+CALLBACK_FLOOD_COOLDOWN_SEC = max(30, _env_int("CALLBACK_FLOOD_COOLDOWN_SEC", 120))
+CALLBACK_FLOOD_REPEAT_WINDOW = max(
+    CALLBACK_FLOOD_COOLDOWN_SEC,
+    _env_int("CALLBACK_FLOOD_REPEAT_WINDOW", 86400),
+)
 TELEGRAM_AUDIT_LOG = _env_bool("TELEGRAM_AUDIT_LOG", True)
 TELEGRAM_AUDIT_LOG_MAXLEN = max(32, _env_int("TELEGRAM_AUDIT_LOG_MAXLEN", 120))
 SPAM_SIGNAL_ALERT_COOLDOWN = max(60, _env_int("SPAM_SIGNAL_ALERT_COOLDOWN", 300))
@@ -271,6 +276,9 @@ print(
     "🛡️ User policy:"
     f" update_limit={USER_UPDATE_RATE_LIMIT}/{USER_UPDATE_RATE_WINDOW}s"
     f", update_ban={USER_UPDATE_BAN_TYPE}"
+    f", callback_limit={USER_CALLBACK_RATE_LIMIT}/{USER_CALLBACK_RATE_WINDOW}s"
+    f", callback_l1_cd={CALLBACK_FLOOD_COOLDOWN_SEC}s"
+    f", callback_repeat_window={CALLBACK_FLOOD_REPEAT_WINDOW}s"
     f", audit_log={TELEGRAM_AUDIT_LOG}"
     f", spam_signal_cd={SPAM_SIGNAL_ALERT_COOLDOWN}s"
     f" spam_perm_first={SPAM_PERMANENT_ON_FIRST_HIT}"
@@ -2347,6 +2355,27 @@ def _cooldown_allows(bucket, key, cooldown_sec):
                     NOTICE_COOLDOWN_TRACKER.pop(stale_key, None)
         return True
 
+def _get_cooldown_remaining(bucket, key):
+    skey = str(key or "unknown")
+    redis_key = f"cooldown:{bucket}:{skey}"
+
+    if RDS is not None:
+        try:
+            ttl = int(RDS.ttl(redis_key))
+            return ttl if ttl > 0 else 0
+        except Exception as e:
+            dprint(f"cooldown ttl redis fallback [{bucket}] -> {e}")
+
+    local_key = f"{bucket}:{skey}"
+    now = time.time()
+    with NOTICE_COOLDOWN_LOCK:
+        expires_at = float(NOTICE_COOLDOWN_TRACKER.get(local_key, 0) or 0)
+
+    remaining = expires_at - now
+    if remaining <= 0:
+        return 0
+    return int(remaining) + 1
+
 def _to_valid_ip(ip_text: str) -> str:
     raw = (ip_text or "").strip()
     if not raw:
@@ -3429,12 +3458,14 @@ def clear_user_ban_trackers(user_id):
             f"user_command:{user_id}",
             f"user_text:{user_id}",
             f"user_callback:{user_id}",
+            f"callback_flood_offense:{user_id}",
         ):
             RATE_LIMIT_TRACKER.pop(local_key, None)
     with NOTICE_COOLDOWN_LOCK:
         for local_key in (
             f"banned_user_notice:{user_id}",
             f"non_vi_notice:{user_id}",
+            f"callback_flood_block:{user_id}",
         ):
             NOTICE_COOLDOWN_TRACKER.pop(local_key, None)
     with qr_failures_lock:
@@ -3450,11 +3481,13 @@ def clear_user_ban_trackers(user_id):
                 f"rl:user_command:{user_id}",
                 f"rl:user_text:{user_id}",
                 f"rl:user_callback:{user_id}",
+                f"rl:callback_flood_offense:{user_id}",
                 f"spam:SPAM_CALLBACK:{user_id}",
                 f"spam:SPAM_COMMAND:{user_id}",
                 f"spam:SPAM_TEXT:{user_id}",
                 f"cooldown:banned_user_notice:{user_id}",
                 f"cooldown:non_vi_notice:{user_id}",
+                f"cooldown:callback_flood_block:{user_id}",
             ]
             RDS.delete(*keys)
         except Exception as e:
@@ -4482,6 +4515,15 @@ def handle_callback_query(cb):
     cb_msg_id = cb.get("message", {}).get("message_id")
 
     if user_id:
+        callback_cooldown_left = _get_cooldown_remaining("callback_flood_block", user_id)
+        if callback_cooldown_left > 0:
+            tg_answer_callback(cb_id, "⏳ Thao tác quá nhanh, thử lại sau 2 phút", True)
+            dprint(
+                f"🚫 Callback blocked by cooldown: user={user_id} "
+                f"remaining={callback_cooldown_left}s"
+            )
+            return
+
         limited, count = _rate_limit_exceeded(
             "user_callback",
             user_id,
@@ -4489,19 +4531,54 @@ def handle_callback_query(cb):
             USER_CALLBACK_RATE_WINDOW
         )
         if limited:
-            tg_answer_callback(cb_id, "🚫 Bấm nhanh quá, chậm lại chút nhé", True)
-            _notify_admin_spam_signal(
-                "SPAM_CALLBACK_SIGNAL",
-                user_id=user_id,
-                username=username,
-                count=count,
-                window_sec=USER_CALLBACK_RATE_WINDOW,
-                detail=f"count={count}/{USER_CALLBACK_RATE_LIMIT}"
+            repeated, offense_count = _rate_limit_exceeded(
+                "callback_flood_offense",
+                user_id,
+                1,
+                CALLBACK_FLOOD_REPEAT_WINDOW
             )
-            track_error(user_id, username, "SPAM_CALLBACK")
+            if repeated:
+                apply_ban(
+                    user_id,
+                    "PERMANENT",
+                    note_override=(
+                        "Ban vĩnh viễn: callback spam tái phạm "
+                        f"({offense_count} lần/{CALLBACK_FLOOD_REPEAT_WINDOW}s)"
+                    )
+                )
+                notify_admin_spam(
+                    user_id,
+                    username,
+                    "PERMANENT",
+                    count,
+                    reason_label="Spam callback tái phạm",
+                    window_sec=USER_CALLBACK_RATE_WINDOW
+                )
+                tg_answer_callback(
+                    cb_id,
+                    "🚫 Bạn đã bị khóa vĩnh viễn do tái phạm spam nút",
+                    True
+                )
+                if chat_id:
+                    tg_send(
+                        chat_id,
+                        "🚫 <b>TÀI KHOẢN ĐÃ BỊ KHÓA VĨNH VIỄN</b>\n\n"
+                        "⚠️ Lý do: Tái phạm spam thao tác nút liên tục.\n"
+                        "📞 Liên hệ admin: @BonBonxHPx"
+                    )
+                dprint(
+                    f"🚫 Callback repeat offense -> permanent ban: user={user_id} "
+                    f"offense={offense_count} callback_count={count}/{USER_CALLBACK_RATE_LIMIT}"
+                )
+                return
+
+            _cooldown_allows("callback_flood_block", user_id, CALLBACK_FLOOD_COOLDOWN_SEC)
+            tg_answer_callback(cb_id, "⏳ Thao tác quá nhanh, thử lại sau 2 phút", True)
             dprint(
-                f"🚫 Callback spam blocked: user={user_id} "
-                f"count={count}/{USER_CALLBACK_RATE_LIMIT} window={USER_CALLBACK_RATE_WINDOW}s"
+                f"⏳ Callback level-1 cooldown: user={user_id} "
+                f"count={count}/{USER_CALLBACK_RATE_LIMIT} "
+                f"cooldown={CALLBACK_FLOOD_COOLDOWN_SEC}s "
+                f"offense=1/{CALLBACK_FLOOD_REPEAT_WINDOW}s"
             )
             return
 
