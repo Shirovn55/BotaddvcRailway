@@ -279,6 +279,7 @@ print(
     f", banned_notice_cd={BANNED_USER_NOTICE_COOLDOWN}s"
     f", unban_all_on_boot={UNBAN_ALL_BLOCKED_USERS_ON_BOOT}"
     f", admin_private={ADMIN_COMMAND_REQUIRE_PRIVATE_CHAT}"
+    f", sheet_mirror_wallet={SHEET_MIRROR_WALLET}"
 )
 if BOT_SELF_ID:
     print(f"🤖 Bot self id detected: {BOT_SELF_ID}")
@@ -3602,7 +3603,7 @@ def ensure_user_exists(user_id, username=""):
     """
     ✅ V6 PG-PRIMARY:
     - PostgreSQL: tạo dòng wallet nếu chưa có (nguồn chính)
-    - Google Sheet: mirror fire-and-forget (không block critical path)
+    - Google Sheet: mirror tuỳ chọn (SHEET_MIRROR_WALLET), chỉ để theo dõi
     - ✅ User mới sẽ có status='new' và balance=0, cần kích hoạt để nhận 5100đ
     """
     user_id = int(user_id)
@@ -3619,8 +3620,8 @@ def ensure_user_exists(user_id, username=""):
             updated_at = NOW()
     """, (user_id, username or "", username or "", username or ""))
 
-    # 2) Sheet mirror (fire-and-forget) — chỉ để theo dõi
-    if SHEET_READY:
+    # 2) Sheet mirror (optional) — chỉ để theo dõi, không ảnh hưởng dữ liệu chính
+    if SHEET_READY and SHEET_MIRROR_WALLET:
         try:
             row = get_user_row(user_id)
             if not row:
