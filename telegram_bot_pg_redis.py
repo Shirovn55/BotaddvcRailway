@@ -144,10 +144,38 @@ USER_UPDATE_RATE_WINDOW = max(10, _env_int("USER_UPDATE_RATE_WINDOW", 60))
 USER_UPDATE_BAN_TYPE = (os.getenv("USER_UPDATE_BAN_TYPE", "PERMANENT") or "PERMANENT").strip().upper()
 WEBHOOK_TRUST_PROXY_HEADERS = _env_bool("WEBHOOK_TRUST_PROXY_HEADERS", True)
 WEBHOOK_REQUIRE_CLOUDFLARE = _env_bool("WEBHOOK_REQUIRE_CLOUDFLARE", False)
+WEBHOOK_TRUSTED_PROXY_CIDRS = _env_cidr_list(
+    "WEBHOOK_TRUSTED_PROXY_CIDRS",
+    "127.0.0.1/32,::1/128,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16",
+)
 WEBHOOK_CLOUDFLARE_IP_ALLOWLIST = _env_cidr_list(
     "WEBHOOK_CLOUDFLARE_IP_ALLOWLIST",
-    "",
+    ",".join([
+        "173.245.48.0/20",
+        "103.21.244.0/22",
+        "103.22.200.0/22",
+        "103.31.4.0/22",
+        "141.101.64.0/18",
+        "108.162.192.0/18",
+        "190.93.240.0/20",
+        "188.114.96.0/20",
+        "197.234.240.0/22",
+        "198.41.128.0/17",
+        "162.158.0.0/15",
+        "104.16.0.0/13",
+        "104.24.0.0/14",
+        "172.64.0.0/13",
+        "131.0.72.0/22",
+        "2400:cb00::/32",
+        "2606:4700::/32",
+        "2803:f800::/32",
+        "2405:b500::/32",
+        "2405:8100::/32",
+        "2a06:98c0::/29",
+        "2c0f:f248::/32",
+    ]),
 )
+WEBHOOK_REJECT_NON_POST = _env_bool("WEBHOOK_REJECT_NON_POST", True)
 USER_COMMAND_RATE_LIMIT = max(5, _env_int("USER_COMMAND_RATE_LIMIT", 8))
 USER_COMMAND_RATE_WINDOW = max(5, _env_int("USER_COMMAND_RATE_WINDOW", 20))
 USER_TEXT_RATE_LIMIT = max(8, _env_int("USER_TEXT_RATE_LIMIT", 15))
@@ -220,6 +248,7 @@ print(
     f", suspicious_user_ban={WEBHOOK_SUSPICIOUS_USER_BAN_TYPE}"
     f", trust_proxy_headers={WEBHOOK_TRUST_PROXY_HEADERS}"
     f", require_cloudflare={WEBHOOK_REQUIRE_CLOUDFLARE}"
+    f", reject_non_post={WEBHOOK_REJECT_NON_POST}"
 )
 if TELEGRAM_WEBHOOK_ENFORCE_IP_ALLOWLIST:
     print(
@@ -230,6 +259,11 @@ if WEBHOOK_REQUIRE_CLOUDFLARE:
     print(
         "🔐 Cloudflare edge allowlist ranges:"
         f" {', '.join(str(x) for x in WEBHOOK_CLOUDFLARE_IP_ALLOWLIST) or '(none)'}"
+    )
+if WEBHOOK_TRUST_PROXY_HEADERS:
+    print(
+        "🔐 Trusted proxy CIDRs (for XFF/X-Real-IP):"
+        f" {', '.join(str(x) for x in WEBHOOK_TRUSTED_PROXY_CIDRS) or '(none)'}"
     )
 print(
     "🛡️ User policy:"
@@ -2335,6 +2369,23 @@ def _to_valid_ip(ip_text: str) -> str:
     except Exception:
         return ""
 
+def _ip_in_cidrs(ip_text: str, cidrs) -> bool:
+    normalized = _to_valid_ip(ip_text)
+    if not normalized:
+        return False
+    try:
+        ip_obj = ipaddress.ip_address(normalized)
+    except Exception:
+        return False
+
+    for net in cidrs or ():
+        try:
+            if ip_obj.version == net.version and ip_obj in net:
+                return True
+        except Exception:
+            continue
+    return False
+
 def _extract_client_ip():
     remote_ip = _to_valid_ip(request.remote_addr or "")
     if not WEBHOOK_TRUST_PROXY_HEADERS:
@@ -2349,10 +2400,35 @@ def _extract_client_ip():
             return "fp:" + hashlib.sha256(fp_seed.encode("utf-8")).hexdigest()[:20]
         return "unknown"
 
+    cf_ip = _to_valid_ip(request.headers.get("CF-Connecting-IP", "") or "")
+    from_cloudflare_edge = _ip_in_cidrs(remote_ip, WEBHOOK_CLOUDFLARE_IP_ALLOWLIST)
+
+    # Khi request đi qua Cloudflare edge hợp lệ thì luôn ưu tiên CF-Connecting-IP
+    # để lấy đúng IP gốc của Telegram/client thay vì IP edge 172.x/104.x.
+    if cf_ip and from_cloudflare_edge:
+        return cf_ip
+
     if WEBHOOK_REQUIRE_CLOUDFLARE:
-        cf_ip = _to_valid_ip(request.headers.get("CF-Connecting-IP", "") or "")
         if cf_ip:
             return cf_ip
+        if remote_ip:
+            return remote_ip
+        return "unknown"
+
+    trusted_forwarded_proxy = (
+        from_cloudflare_edge
+        or _ip_in_cidrs(remote_ip, WEBHOOK_TRUSTED_PROXY_CIDRS)
+    )
+    if not trusted_forwarded_proxy:
+        if remote_ip:
+            return remote_ip
+        fp_seed = "|".join([
+            str(request.remote_addr or "").strip(),
+            (request.headers.get("User-Agent", "") or "").strip(),
+        ])
+        if fp_seed:
+            return "fp:" + hashlib.sha256(fp_seed.encode("utf-8")).hexdigest()[:20]
+        return "unknown"
 
     real_ip = _to_valid_ip(request.headers.get("X-Real-IP", "") or "")
     if real_ip:
@@ -2407,46 +2483,17 @@ def _is_telegram_webhook_ip_allowed(ip: str) -> bool:
         return True
     if not TELEGRAM_WEBHOOK_IP_ALLOWLIST:
         return False
+    return _ip_in_cidrs(ip, TELEGRAM_WEBHOOK_IP_ALLOWLIST)
 
-    normalized = _to_valid_ip(ip)
-    if not normalized:
-        return False
-
-    try:
-        ip_obj = ipaddress.ip_address(normalized)
-    except Exception:
-        return False
-
-    for net in TELEGRAM_WEBHOOK_IP_ALLOWLIST:
-        try:
-            if ip_obj.version == net.version and ip_obj in net:
-                return True
-        except Exception:
-            continue
-    return False
+def _is_cloudflare_edge_ip(ip: str) -> bool:
+    return _ip_in_cidrs(ip, WEBHOOK_CLOUDFLARE_IP_ALLOWLIST)
 
 def _is_cloudflare_edge_ip_allowed(ip: str) -> bool:
     if not WEBHOOK_REQUIRE_CLOUDFLARE:
         return True
     if not WEBHOOK_CLOUDFLARE_IP_ALLOWLIST:
         return False
-
-    normalized = _to_valid_ip(ip)
-    if not normalized:
-        return False
-
-    try:
-        ip_obj = ipaddress.ip_address(normalized)
-    except Exception:
-        return False
-
-    for net in WEBHOOK_CLOUDFLARE_IP_ALLOWLIST:
-        try:
-            if ip_obj.version == net.version and ip_obj in net:
-                return True
-        except Exception:
-            continue
-    return False
+    return _is_cloudflare_edge_ip(ip)
 
 def _note_webhook_reject(reason: str, extra: str = ""):
     cooldown_sec = max(0, int(WEBHOOK_REJECT_LOG_COOLDOWN or 0))
@@ -6207,6 +6254,9 @@ def _precheck_telegram_webhook_ip():
         return None
 
     if request.method != "POST":
+        if WEBHOOK_REJECT_NON_POST:
+            _note_webhook_reject("invalid_method", f"method={request.method}")
+            return "Not Found", 404
         return None
 
     edge_ip = _to_valid_ip(request.remote_addr or "")
