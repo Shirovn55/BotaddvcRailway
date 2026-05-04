@@ -5524,22 +5524,37 @@ def handle_update(update):
         if user_id not in PENDING_VOUCHER:
             return
 
-    # ===== ADMIN: /thongbao =====
-    if text and text.startswith("/thongbao"):
+    # ===== ADMIN: Broadcast command (/alo only) =====
+    broadcast_parts = text.split(maxsplit=1) if text else []
+    broadcast_cmd = ""
+    if broadcast_parts:
+        broadcast_cmd = str(broadcast_parts[0] or "").split("@", 1)[0].strip().lower()
+
+    # Lệnh cũ đã tắt: chỉ dùng /alo
+    if broadcast_cmd == "/thongbao":
+        if not _is_admin_context(user_id, chat_id):
+            _send_admin_denied(chat_id)
+            return
+        tg_send(
+            chat_id,
+            "⚠️ <b>Lệnh /thongbao đã tắt.</b>\n"
+            "Dùng đúng cú pháp: <code>/alo [nội dung]</code>"
+        )
+        return
+
+    if broadcast_cmd == "/alo":
         if not _is_admin_context(user_id, chat_id):
             _send_admin_denied(chat_id)
             return
 
         message_id = msg.get("message_id", 0)
-
-        parts = text.split(maxsplit=1)
-        if len(parts) < 2:
+        if len(broadcast_parts) < 2 or not str(broadcast_parts[1] or "").strip():
             tg_send(
                 chat_id,
                 "📢 <b>HƯỚNG DẪN BROADCAST</b>\n\n"
-                "Sử dụng: <code>/thongbao [nội dung]</code>\n\n"
+                "Sử dụng: <code>/alo [nội dung]</code>\n\n"
                 "Ví dụ:\n"
-                "<code>/thongbao Đêm qua server bị lỗi dẫn tới bot không hoạt động, "
+                "<code>/alo Đêm qua server bị lỗi dẫn tới bot không hoạt động, "
                 "Hiện tại BOT đã hoạt động bình thường trở lại.</code>"
             )
             return
@@ -5564,7 +5579,7 @@ def handle_update(update):
             dprint(f"⏳ COOLDOWN BLOCKED: wait {wait_time}s")
             return
 
-        message = parts[1].strip()
+        message = str(broadcast_parts[1] or "").strip()
 
         global IS_BROADCASTING
         if IS_BROADCASTING:
