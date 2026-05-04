@@ -883,6 +883,9 @@ if SHEET_READY:
 # =========================================================
 PENDING_VOUCHER = {}
 PENDING_VOUCHER_TTL = 120  # 2 phút - expire nếu user không gửi cookie
+QUICK_SAVE_INFLIGHT = {}
+QUICK_SAVE_INFLIGHT_TTL = 120
+QUICK_SAVE_INFLIGHT_LOCK = threading.Lock()
 
 # ✅ DYNAMIC COMBO DETECTION - Không hardcode, tự phát hiện từ Sheet
 # Combo nào có trong VoucherStock với Combo = "combo1", "combo2"... đều tự động hiện
@@ -995,6 +998,54 @@ VOUCHER_STOCK_CACHE = {
     "ts": 0
 }
 VOUCHER_STOCK_TTL = 60  # 60 giây
+VOUCHER_STOCK_FETCH_TIMEOUT = max(3, _env_int("VOUCHER_STOCK_FETCH_TIMEOUT", 8))
+VOUCHER_STOCK_CACHE_LOCK = threading.Lock()
+
+def _quick_save_claim(user_id):
+    uid = int(user_id or 0)
+    if uid <= 0:
+        return False
+    now = time.time()
+    with QUICK_SAVE_INFLIGHT_LOCK:
+        for k, ts in list(QUICK_SAVE_INFLIGHT.items()):
+            if now - float(ts or 0) > QUICK_SAVE_INFLIGHT_TTL:
+                QUICK_SAVE_INFLIGHT.pop(k, None)
+        if uid in QUICK_SAVE_INFLIGHT:
+            return False
+        QUICK_SAVE_INFLIGHT[uid] = now
+    return True
+
+def _quick_save_release(user_id):
+    uid = int(user_id or 0)
+    if uid <= 0:
+        return
+    with QUICK_SAVE_INFLIGHT_LOCK:
+        QUICK_SAVE_INFLIGHT.pop(uid, None)
+
+def _fetch_voucher_stock_rows_with_timeout(timeout_sec: int | None = None):
+    if not SHEET_READY or ws_voucher is None:
+        return None, "sheet_not_ready"
+    wait_timeout = max(3, int(timeout_sec or VOUCHER_STOCK_FETCH_TIMEOUT))
+    done = threading.Event()
+    holder = {"rows": None, "err": None}
+
+    def _worker():
+        try:
+            holder["rows"] = ws_voucher.get_all_records()
+        except Exception as ex:
+            holder["err"] = ex
+        finally:
+            done.set()
+
+    threading.Thread(target=_worker, daemon=True).start()
+    if not done.wait(wait_timeout):
+        return None, f"timeout_after_{wait_timeout}s"
+    if holder["err"] is not None:
+        return None, str(holder["err"])
+    rows = holder.get("rows")
+    if not isinstance(rows, list):
+        return None, "invalid_rows"
+    return rows, ""
 
 def get_voucher_stock_cached():
     """
@@ -1004,11 +1055,12 @@ def get_voucher_stock_cached():
     global VOUCHER_STOCK_CACHE
     
     now = time.time()
-    
-    # Check cache
-    if VOUCHER_STOCK_CACHE["rows"] and (now - VOUCHER_STOCK_CACHE["ts"] < VOUCHER_STOCK_TTL):
+    with VOUCHER_STOCK_CACHE_LOCK:
+        cached_rows = VOUCHER_STOCK_CACHE.get("rows")
+        cached_ts = float(VOUCHER_STOCK_CACHE.get("ts") or 0)
+    if cached_rows and (now - cached_ts < VOUCHER_STOCK_TTL):
         dprint("✅ VOUCHER_STOCK_CACHE HIT")
-        return VOUCHER_STOCK_CACHE["rows"]
+        return list(cached_rows)
     
     # Cache miss → gọi Sheet
     dprint("⚠️ VOUCHER_STOCK_CACHE MISS, calling Sheet...")
@@ -1017,17 +1069,22 @@ def get_voucher_stock_cached():
         return []
     
     try:
-        rows = ws_voucher.get_all_records()
-        VOUCHER_STOCK_CACHE["rows"] = rows
-        VOUCHER_STOCK_CACHE["ts"] = now
+        rows, fetch_err = _fetch_voucher_stock_rows_with_timeout(VOUCHER_STOCK_FETCH_TIMEOUT)
+        if rows is None:
+            raise RuntimeError(fetch_err or "sheet_fetch_failed")
+        with VOUCHER_STOCK_CACHE_LOCK:
+            VOUCHER_STOCK_CACHE["rows"] = list(rows)
+            VOUCHER_STOCK_CACHE["ts"] = now
         dprint(f"✅ Cached {len(rows)} vouchers")
-        return rows
+        return list(rows)
     except Exception as e:
         dprint(f"❌ get_voucher_stock_cached error: {e}")
         # Fallback: trả cache cũ nếu có
-        if VOUCHER_STOCK_CACHE["rows"]:
+        with VOUCHER_STOCK_CACHE_LOCK:
+            stale_rows = VOUCHER_STOCK_CACHE.get("rows")
+        if stale_rows:
             dprint("⚠️ Using stale cache")
-            return VOUCHER_STOCK_CACHE["rows"]
+            return list(stale_rows)
         return []
 
 # =========================================================
@@ -1510,8 +1567,8 @@ def build_quick_save_keyboard():
         }
     
     try:
-        # Đọc từ VoucherStock sheet
-        all_rows = ws_voucher.get_all_records()
+        # Đọc từ cache trước để tránh gọi Sheet trực tiếp khi callback
+        all_rows = get_voucher_stock_cached()
         
         buttons = []
         button_row = []
@@ -3878,6 +3935,27 @@ def parse_cookies(text):
     
     return cookies
 
+def parse_money_int(value, default=0):
+    """
+    Parse giá trị tiền từ Sheet về int an toàn.
+    Hỗ trợ số, chuỗi có phân tách (.,,), hậu tố đ/VNĐ.
+    """
+    if isinstance(value, (int, float)):
+        try:
+            return int(value)
+        except Exception:
+            return int(default)
+    raw = str(value or "").strip()
+    if not raw:
+        return int(default)
+    cleaned = re.sub(r"[^\d\-]", "", raw)
+    if cleaned in ("", "-", "+"):
+        return int(default)
+    try:
+        return int(cleaned)
+    except Exception:
+        return int(default)
+
 # =========================================================
 # VOUCHER UTIL
 # =========================================================
@@ -4653,80 +4731,83 @@ def handle_callback_query(cb):
         if status != "active":
             tg_answer_callback(cb_id, "❌ Tài khoản chưa được kích hoạt", True)
             return
-        
-        # ✅ GỬI MESSAGE "ĐANG LƯU VOUCHER..."
-        tg_answer_callback(cb_id)
-        tg_send(chat_id, "⏳ <b>Đang lưu voucher...</b>")
-        
-        # ✅ TÌM VOUCHER ĐỘNG TỪ SHEET (không dùng voucher_map)
-        # voucher_key đã normalize (no space, lowercase)
-        voucher_info = None
-        voucher_cmd = voucher_key  # ← FIX: Define voucher_cmd
-        err_msg = None
-        
+
+        if not _quick_save_claim(user_id):
+            tg_answer_callback(cb_id, "⏳ Đang lưu voucher trước đó, chờ chút nhé", True)
+            return
+
+        deducted_amount = 0
+        voucher_cmd = voucher_key
         try:
-            rows = get_voucher_stock_cached()
-            
-            for r in rows:
-                ten_ma = normalize_voucher_key(r.get("Tên Mã", ""))
-                if ten_ma == voucher_key:
-                    # Check trạng thái
-                    if r.get("Trạng Thái") != "Còn Mã":
-                        err_msg = "Voucher này tạm hết mã"
+            # ✅ GỬI MESSAGE "ĐANG LƯU VOUCHER..."
+            tg_answer_callback(cb_id)
+            tg_send(chat_id, "⏳ <b>Đang lưu voucher...</b>")
+
+            # ✅ TÌM VOUCHER ĐỘNG TỪ CACHE/SHEET
+            voucher_info = None
+            err_msg = None
+            try:
+                rows = get_voucher_stock_cached()
+                for r in rows:
+                    ten_ma = normalize_voucher_key(r.get("Tên Mã", ""))
+                    if ten_ma == voucher_key:
+                        if r.get("Trạng Thái") != "Còn Mã":
+                            err_msg = "Voucher này tạm hết mã"
+                            break
+                        voucher_info = r
+                        voucher_cmd = str(r.get("Tên Mã", voucher_key) or voucher_key).strip()
                         break
-                    voucher_info = r
-                    voucher_cmd = r.get("Tên Mã", voucher_key)  # ← FIX: Lấy tên gốc
-                    break
-            
-            if not voucher_info and not err_msg:
-                err_msg = "Không tìm thấy voucher"
-        except Exception as e:
-            dprint(f"[ERROR] Finding voucher: {e}")
-            dprint(f"[ERROR] Traceback: {traceback.format_exc()}")
-            err_msg = f"Lỗi đọc sheet: {str(e)}"
-        
-        if not voucher_info:
-            tg_send(
-                chat_id,
-                f"❌ <b>LƯU THẤT BẠI</b>\n\n"
-                f"⚠️ Lỗi: {err_msg}"
-            )
-            return
-        
-        price = int(voucher_info.get("Giá", 0))
-        display_name = voucher_info.get("Tên Mã", voucher_key)
-        
-        # Check balance
-        if balance < price:
-            tg_send(
-                chat_id,
-                f"❌ <b>KHÔNG ĐỦ SỐ DƯ</b>\n\n"
-                f"💰 Cần: <b>{price:,}đ</b>\n"
-                f"💼 Số dư: <b>{balance:,}đ</b>\n"
-                f"💸 Thiếu: <b>{price - balance:,}đ</b>"
-            )
-            return
-        
-        # Trừ tiền trước
-        success, new_balance = deduct_balance_atomic(user_id, price)
-        
-        if not success:
-            tg_send(
-                chat_id,
-                f"❌ <b>TRỪ TIỀN THẤT BẠI</b>\n\n"
-                f"💰 Cần: <b>{price:,}đ</b>\n"
-                f"💼 Số dư: <b>{new_balance:,}đ</b>"
-            )
-            return
-        
-        # Lưu voucher
-        try:
+                if not voucher_info and not err_msg:
+                    err_msg = "Không tìm thấy voucher"
+            except Exception as e:
+                dprint(f"[ERROR] Finding voucher: {e}")
+                dprint(f"[ERROR] Traceback: {traceback.format_exc()}")
+                err_msg = f"Lỗi đọc sheet/cache: {str(e)}"
+
+            if not voucher_info:
+                tg_send(
+                    chat_id,
+                    f"❌ <b>LƯU THẤT BẠI</b>\n\n"
+                    f"⚠️ Lỗi: {err_msg}"
+                )
+                return
+
+            price = parse_money_int(voucher_info.get("Giá", 0), 0)
+            if price <= 0:
+                tg_send(
+                    chat_id,
+                    "❌ <b>LƯU THẤT BẠI</b>\n\n"
+                    "⚠️ Giá voucher không hợp lệ, vui lòng báo admin kiểm tra cột Giá."
+                )
+                return
+
+            # Check balance
+            if balance < price:
+                tg_send(
+                    chat_id,
+                    f"❌ <b>KHÔNG ĐỦ SỐ DƯ</b>\n\n"
+                    f"💰 Cần: <b>{price:,}đ</b>\n"
+                    f"💼 Số dư: <b>{balance:,}đ</b>\n"
+                    f"💸 Thiếu: <b>{price - balance:,}đ</b>"
+                )
+                return
+
+            # Trừ tiền trước
+            success, new_balance = deduct_balance_atomic(user_id, price)
+            if not success:
+                tg_send(
+                    chat_id,
+                    f"❌ <b>TRỪ TIỀN THẤT BẠI</b>\n\n"
+                    f"💰 Cần: <b>{price:,}đ</b>\n"
+                    f"💼 Số dư: <b>{new_balance:,}đ</b>"
+                )
+                return
+            deducted_amount = int(price)
+
+            # Lưu voucher
             ok, result = save_voucher_and_check(cookie, voucher_info)
-            
             if ok:
-                # Thành công
                 real_balance = get_balance_direct(user_id)
-                
                 tg_send(
                     chat_id,
                     f"🎉 <b>LƯU THÀNH CÔNG</b>\n\n"
@@ -4736,49 +4817,44 @@ def handle_callback_query(cb):
                     f"💼 Số dư: <b>{real_balance:,}đ</b>",
                     build_main_keyboard()
                 )
-                
-                # Log
                 log_voucher_save(user_id, username, voucher_cmd, 1, price, real_balance, "✅")
-                
-            else:
-                # Thất bại → Hoàn tiền
-                update_balance_atomic(user_id, price)
-                real_balance = get_balance_direct(user_id)
-                
-                # Format lỗi thân thiện
-                error_message = format_shopee_error(result)
-                
-                tg_send(
-                    chat_id,
-                    f"{error_message}\n\n"
-                    f"💸 Đã hoàn tiền: <b>+{price:,}đ</b>\n"
-                    f"💼 Số dư: <b>{real_balance:,}đ</b>",
-                    build_main_keyboard()
-                )
-                
-                # Log
-                log_voucher_save(user_id, username, voucher_cmd, 1, 0, real_balance, f"❌ {result}")
-        
-        except Exception as e:
-            # ❌ EXCEPTION → Hoàn tiền và báo lỗi
-            dprint(f"[ERROR] Save voucher exception: {e}")
-            dprint(f"[ERROR] Traceback: {traceback.format_exc()}")
-            
-            update_balance_atomic(user_id, price)
+                deducted_amount = 0
+                return
+
+            # Thất bại → Hoàn tiền
+            if deducted_amount > 0:
+                update_balance_atomic(user_id, deducted_amount)
+                deducted_amount = 0
             real_balance = get_balance_direct(user_id)
-            
+            error_message = format_shopee_error(result)
             tg_send(
                 chat_id,
-                f"❌ <b>LỖI HỆ THỐNG</b>\n\n"
-                f"⚠️ Exception: {str(e)[:200]}\n\n"
+                f"{error_message}\n\n"
                 f"💸 Đã hoàn tiền: <b>+{price:,}đ</b>\n"
                 f"💼 Số dư: <b>{real_balance:,}đ</b>",
                 build_main_keyboard()
             )
-            
-            log_voucher_save(user_id, username, voucher_cmd, 1, 0, real_balance, f"❌ EXCEPTION")
-        
-        return
+            log_voucher_save(user_id, username, voucher_cmd, 1, 0, real_balance, f"❌ {result}")
+            return
+
+        except Exception as e:
+            dprint(f"[ERROR] QUICK_SAVE exception: {e}")
+            dprint(f"[ERROR] Traceback: {traceback.format_exc()}")
+            if deducted_amount > 0:
+                update_balance_atomic(user_id, deducted_amount)
+            real_balance = get_balance_direct(user_id)
+            tg_send(
+                chat_id,
+                f"❌ <b>LỖI HỆ THỐNG</b>\n\n"
+                f"⚠️ Exception: {str(e)[:200]}\n\n"
+                f"💸 Nếu đã trừ tiền, hệ thống đã tự hoàn.\n"
+                f"💼 Số dư: <b>{real_balance:,}đ</b>",
+                build_main_keyboard()
+            )
+            log_voucher_save(user_id, username, voucher_cmd, 1, 0, real_balance, "❌ EXCEPTION")
+            return
+        finally:
+            _quick_save_release(user_id)
 
     if data.startswith("SOLD_OUT:"):
         tg_answer_callback(cb_id, "⚠️ Voucher này tạm hết mã. Vui lòng quay lại sau!", True)
